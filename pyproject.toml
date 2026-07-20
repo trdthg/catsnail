@@ -1,0 +1,26 @@
+[project]
+name = "catsnail"
+version = "0.1.0"
+description = "Local-first QEMU test orchestration"
+authors = [
+    { name = "trdthg", email = "trdthg47@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.411",
+    "pytest>=9.0.0",
+    "ruff>=0.12.0",
+]
+
+[tool.pyright]
+include = ["src", "examples", "tests"]
+
+[project.scripts]
+catsnail = "catsnail.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.22,<0.9.0"]
+build-backend = "uv_build"
