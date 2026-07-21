@@ -271,9 +271,14 @@ def _keysym(name: str) -> int:
         "CTRL": 0xFFE3,
         "ENTER": 0xFF0D,
         "ESC": 0xFF1B,
+        "SUPER": 0xFFEB,
         "TAB": 0xFF09,
         "BACKSPACE": 0xFF08,
         "SPACE": 0x20,
+        "UP": 0xFF52,
+        "DOWN": 0xFF54,
+        "LEFT": 0xFF51,
+        "RIGHT": 0xFF53,
     }
     upper = name.upper()
     if upper in keys:

@@ -14,6 +14,10 @@ from catsnail.image import ImageError, iso_cache_directory, resolve_iso
 
 
 class _Response(BytesIO):
+    def __init__(self, payload: bytes, *, status: int = 200) -> None:
+        super().__init__(payload)
+        self.status = status
+
     def __enter__(self) -> _Response:
         return self
 
@@ -102,6 +106,85 @@ def test_rejects_a_download_with_the_wrong_checksum(
         asyncio.run(resolve_iso(machine.iso, machine.sha256))
 
     assert not list((tmp_path / "cache" / "iso").rglob("image.iso"))
+
+
+def test_resumes_a_legacy_partial_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = "https://images.example.test/ubuntu.iso"
+    payload = b"partial ISO download"
+    partial = payload[:8]
+    checksum = hashlib.sha256(payload).hexdigest()
+    cache_directory = tmp_path / "cache" / "iso"
+    directory = cache_directory / hashlib.sha256(url.encode()).hexdigest()
+    directory.mkdir(parents=True)
+    (directory / ".image.1234.part").write_bytes(partial)
+    ranges: list[str | None] = []
+
+    def download(request: object, *, timeout: float) -> _Response:
+        del timeout
+        ranges.append(getattr(request, "get_header")("Range"))
+        return _Response(payload[len(partial) :], status=206)
+
+    monkeypatch.setattr("catsnail.image.urlopen", download)
+    monkeypatch.setenv("CATSNAIL_CONFIG_DIR", str(tmp_path / "cache"))
+
+    image = asyncio.run(resolve_iso(url, checksum))
+
+    assert image is not None
+    assert image.read_bytes() == payload
+    assert ranges == [f"bytes={len(partial)}-"]
+    assert not list(directory.glob("*.part"))
+
+
+def test_restarts_when_a_server_ignores_a_range_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = "https://images.example.test/ubuntu.iso"
+    payload = b"complete ISO download"
+    partial = payload[:8]
+    checksum = hashlib.sha256(payload).hexdigest()
+    cache_directory = tmp_path / "cache" / "iso"
+    directory = cache_directory / hashlib.sha256(url.encode()).hexdigest()
+    directory.mkdir(parents=True)
+    (directory / ".image.part").write_bytes(partial)
+    ranges: list[str | None] = []
+
+    def download(request: object, *, timeout: float) -> _Response:
+        del timeout
+        ranges.append(getattr(request, "get_header")("Range"))
+        return _Response(payload)
+
+    monkeypatch.setattr("catsnail.image.urlopen", download)
+    monkeypatch.setenv("CATSNAIL_CONFIG_DIR", str(tmp_path / "cache"))
+
+    image = asyncio.run(resolve_iso(url, checksum))
+
+    assert image is not None
+    assert image.read_bytes() == payload
+    assert ranges == [f"bytes={len(partial)}-"]
+
+
+def test_preserves_a_partial_download_after_a_network_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = "https://images.example.test/ubuntu.iso"
+    cache_directory = tmp_path / "cache" / "iso"
+    directory = cache_directory / hashlib.sha256(url.encode()).hexdigest()
+    directory.mkdir(parents=True)
+    partial = directory / ".image.part"
+    partial.write_bytes(b"partial")
+
+    def download(*_: object, **__: object) -> _Response:
+        raise OSError("network unavailable")
+
+    monkeypatch.setattr("catsnail.image.urlopen", download)
+    monkeypatch.setenv("CATSNAIL_CONFIG_DIR", str(tmp_path / "cache"))
+
+    with pytest.raises(ImageError, match="network unavailable"):
+        asyncio.run(resolve_iso(url, "0" * 64))
+
+    assert partial.read_bytes() == b"partial"
 
 
 def test_remote_iso_identity_participates_in_checkpoint_keys() -> None:

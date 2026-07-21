@@ -27,6 +27,7 @@ from catsnail import (
 ROOT = Path(__file__).resolve().parents[1]
 XFCE_PANEL = ROOT / "examples" / "assets" / "xfce-panel.png"
 LIGHTDM_CREDENTIALS = ROOT / "examples" / "assets" / "lightdm-credentials.png"
+XFCE_SETTINGS_WINDOW = ROOT / "examples" / "assets" / "xfce-settings-window.png"
 
 DEBIAN_XFCE_URL = (
     "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/"
@@ -70,7 +71,7 @@ async def test_desktop_login(desktop: Guest = use(DESKTOP)):
 
     # Initial serial
     debian = DebianAdapter(desktop)
-    await debian.terminal.run("id -un | grep -qx user", timeout=60)
+    await debian.terminal.assert_run("id -un", LIVE_USER, timeout=60)
     await debian.initialize(timeout=60)
 
 
@@ -98,25 +99,25 @@ async def test_browser_can_open_baidu(
         y=126,
         timeout=60,
     )
+    await desktop.screen.capture("baidu-open")
 
 
 @add_test
 async def test_can_open_system_setting(
     desktop: Guest = use(test_desktop_login),
 ):
-    before_settings = await desktop.screen.capture("before-system-settings")
     debian = DebianAdapter(desktop)
     await debian.terminal.launch(
         "xfce4-settings-manager >/tmp/catsnail-settings.log 2>&1 &",
         timeout=60,
     )
-    await desktop.screen.wait_for_change(before_settings, timeout=30)
+    await desktop.screen.wait_for_image(
+        XFCE_SETTINGS_WINDOW,
+        x=316,
+        y=121,
+        timeout=60,
+    )
     await desktop.screen.capture("system-settings-open")
-
-    # The focused settings window cannot receive shell input, so verify the
-    # process through a new visible terminal without using a guest agent.
-    await debian.terminal.focus()
-    await debian.terminal.run("pgrep -f '^xfce4-settings-manager$'", timeout=30)
 
 
 @add_test

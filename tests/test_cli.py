@@ -372,6 +372,11 @@ def test_failed_terminal_test_keeps_a_resumable_vm_state(tmp_path: Path) -> None
 
     failures = list((target_dir / "run").rglob("failure.state"))
     resumes = list((target_dir / "run").rglob("resume.sh"))
+    screenshots = list((target_dir / "debug").rglob("last-vnc.png"))
     assert len(failures) == 1
     assert failures[0].stat().st_size > 0
     assert len(resumes) == 1
+    assert len(screenshots) == 1
+    report = (target_dir / "report.md").read_text(encoding="utf-8")
+    assert "| FAIL | `test_failure` |" in report
+    assert "last VNC screenshot" in report

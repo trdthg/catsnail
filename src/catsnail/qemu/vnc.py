@@ -12,6 +12,7 @@ import struct
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 
 class VncError(RuntimeError):
@@ -199,7 +200,17 @@ class VncClient:
     async def frame(self, timeout: float = 20.0) -> Frame:
         self.writer.write(struct.pack(">BBHHHH", 3, 0, 0, 0, self.width, self.height))
         await self.writer.drain()
-        return await asyncio.wait_for(self._read_framebuffer_update(), timeout=timeout)
+        latest = await asyncio.wait_for(
+            self._read_framebuffer_update(), timeout=timeout
+        )
+        # Keyboard and pointer events can leave several incremental updates in
+        # flight. Consume the queued tail so captures show the current desktop,
+        # rather than the first update that happened to arrive after a request.
+        # Drain already-buffered updates without another timeout so we do not
+        # cancel a protocol read in the middle of a message.
+        while cast(Any, self.reader)._buffer:
+            latest = await self._read_framebuffer_update()
+        return latest
 
     async def key(self, keysym: int, down: bool = True) -> None:
         self.writer.write(struct.pack(">BBHI", 4, int(down), 0, keysym))
@@ -207,12 +218,21 @@ class VncClient:
 
     async def press(self, keysym: int) -> None:
         await self.key(keysym, True)
+        # QEMU's VNC server accepts both events immediately, while the guest
+        # still models them through a PS/2 controller. Holding a key through
+        # one controller tick prevents intermittent missing characters in
+        # long terminal commands.
+        await asyncio.sleep(0.01)
         await self.key(keysym, False)
 
     async def click(self, x: int, y: int) -> None:
         if not (0 <= x < self.width and 0 <= y < self.height):
             raise VncError(f"pointer coordinates outside framebuffer: ({x}, {y})")
         self.writer.write(struct.pack(">BBHH", 5, 1, x, y))
+        await self.writer.drain()
+        # Flutter/Wayland clients can drop a press-release pair delivered in
+        # the same VNC write. Hold the button across one compositor tick.
+        await asyncio.sleep(0.05)
         self.writer.write(struct.pack(">BBHH", 5, 0, x, y))
         await self.writer.drain()
 
@@ -230,6 +250,12 @@ class VncClient:
             # guest compositor can consume them.  A tiny pace prevents long
             # shell commands from losing their tail under load.
             await asyncio.sleep(0.01)
+        if value:
+            # ``drain()`` confirms delivery to the VNC server, not that QEMU's
+            # PS/2 queue has consumed the final key.  In particular, pressing
+            # Enter immediately can replace the last character of a long
+            # command. Leave the guest one input tick before the next action.
+            await asyncio.sleep(0.1)
 
     async def _handshake(self) -> None:
         version = await self.reader.readexactly(12)

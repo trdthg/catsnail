@@ -15,6 +15,7 @@ from catsnail.qemu.artifacts import RunArtifacts
 from catsnail.qemu.network import SocketAttachment, UserAttachment
 from catsnail.qemu.qmp import QmpClient
 from catsnail.qemu.runner import (
+    QemuNetwork,
     QemuProcess,
     QemuRunError,
     QemuRunner,
@@ -183,6 +184,26 @@ def test_build_command_adds_a_user_egress_nic(tmp_path: Path) -> None:
     assert (
         "virtio-net-pci,id=catsnail-user0,netdev=user0,mac=52:54:00:12:34:56" in command
     )
+
+
+def test_build_command_forwards_control_over_the_first_user_nic(
+    tmp_path: Path,
+) -> None:
+    artifacts = RunArtifacts.create(tmp_path / "target")
+    command = QemuRunner().build_command(
+        Machine(),
+        artifacts,
+        network=QemuNetwork(control_port=48123),
+        network_attachments=(
+            UserAttachment("10.66.12.0/24", "52:54:00:12:34:56"),
+        ),
+    )
+
+    assert (
+        "user,id=user0,net=10.66.12.0/24,hostfwd=tcp:127.0.0.1:48123-:8123"
+        in command
+    )
+    assert "e1000,netdev=control,mac=52:54:00:52:00:01" not in command
 
 
 @pytest.mark.skipif(

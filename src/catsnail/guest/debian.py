@@ -123,6 +123,56 @@ class DebianTerminal:
         await result.wait(timeout=timeout)
         return await result.output(timeout=timeout)
 
+    async def assert_output(
+        self,
+        command: str,
+        expected: str,
+        *,
+        admin: bool = False,
+        timeout: float = 120.0,
+    ) -> None:
+        """Require a command's standard output to equal ``expected``.
+
+        A final line feed is normalized because conventional Unix commands
+        write one. Other whitespace remains significant.
+        """
+
+        actual = (await self.output(command, admin=admin, timeout=timeout)).rstrip(
+            "\n"
+        )
+        expected = expected.rstrip("\n")
+        if actual != expected:
+            raise GuestControlError(
+                f"guest command output did not match: {command}\n"
+                f"expected: {expected!r}\n"
+                f"actual: {actual!r}"
+            )
+
+    async def assert_run(
+        self,
+        command: str,
+        *expected: str,
+        admin: bool = False,
+        timeout: float = 120.0,
+    ) -> None:
+        """Run a command and require output fragments in their emitted order.
+
+        Output is polled while the command runs. The command must subsequently
+        finish successfully before this method returns.
+        """
+
+        if not expected or any(not fragment for fragment in expected):
+            raise ValueError("assert_run needs one or more non-empty output fragments")
+        result = await self.command(
+            command,
+            admin=admin,
+            timeout=timeout,
+            capture_output=True,
+        )
+        deadline = time.monotonic() + timeout
+        await result.wait_for_output(expected, deadline=deadline)
+        await result.wait(timeout=max(0.0, deadline - time.monotonic()))
+
     async def focus(self) -> None:
         """Open a new terminal window and give it keyboard focus."""
 
@@ -208,16 +258,42 @@ class DebianTerminal:
         else:
             self._server_started = True
             return
+        probe_timeout = min(timeout, 5.0)
+        if await self._open_terminal_with_shortcut(timeout=probe_timeout):
+            self._server_started = True
+            return
+        if await self._open_terminal_with_search(timeout=probe_timeout):
+            self._server_started = True
+            return
+        raise GuestControlError("could not open a terminal in the guest desktop")
+
+    async def _open_terminal_with_shortcut(self, *, timeout: float) -> bool:
         await self._keyboard.shortcut("CTRL", "ALT", "T")
         await asyncio.sleep(1)
+        return await self._bootstrap_server(timeout=timeout)
+
+    async def _open_terminal_with_search(self, *, timeout: float) -> bool:
+        await self._keyboard.press("SUPER")
+        await asyncio.sleep(1)
+        await self._keyboard.type("terminal")
+        await self._keyboard.press("ENTER")
+        await asyncio.sleep(2)
+        return await self._bootstrap_server(timeout=timeout)
+
+    async def _bootstrap_server(self, *, timeout: float) -> bool:
         await self._keyboard.type(
             "python3 -m http.server 8123 --directory /tmp >/tmp/catsnail-http.log 2>&1 &"
         )
         await self._keyboard.press("ENTER")
-        await _read_text(
-            f"{self._control_url}/does-not-exist", timeout, allow_not_found=True
-        )
-        self._server_started = True
+        try:
+            await _read_text(
+                f"{self._control_url}/does-not-exist",
+                timeout,
+                allow_not_found=True,
+            )
+        except GuestControlError:
+            return False
+        return True
 
 
 class DebianSerial:
@@ -314,12 +390,56 @@ class TerminalCommand:
                 f"guest command failed with status {status.strip() or 'unknown'}: {self._command}"
                 f"\n{output[-2_000:]}"
             )
+        # The guest writes the control status before Xfce has necessarily
+        # painted the command tail and next prompt into the VNC framebuffer.
+        await asyncio.sleep(2)
         await self._after_step("terminal-command-complete")
 
     async def output(self, *, timeout: float = 120.0) -> str:
         if self._output_url is None:
             return ""
         return await _read_text(self._output_url, timeout, allow_not_found=True)
+
+    async def wait_for_output(
+        self, expected: tuple[str, ...], *, deadline: float
+    ) -> None:
+        """Wait until all output fragments occur in order or the command exits."""
+
+        latest = ""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GuestControlError(
+                    f"guest command did not emit expected output: {self._command}\n"
+                    f"expected in order: {expected!r}\n"
+                    f"actual output:\n{latest[-2_000:]}"
+                )
+            latest = await self.output(timeout=min(2, remaining))
+            if _contains_output_fragments(latest, expected):
+                return
+            status = await _read_text(
+                self._result_url,
+                min(2, remaining),
+                allow_not_found=True,
+            )
+            if status:
+                await self.wait(timeout=remaining)
+                raise GuestControlError(
+                    f"guest command completed without expected output: {self._command}\n"
+                    f"expected in order: {expected!r}\n"
+                    f"actual output:\n{latest[-2_000:]}"
+                )
+            await asyncio.sleep(0.25)
+
+
+def _contains_output_fragments(output: str, expected: tuple[str, ...]) -> bool:
+    position = 0
+    for fragment in expected:
+        position = output.find(fragment, position)
+        if position < 0:
+            return False
+        position += len(fragment)
+    return True
 
 
 class DebianNetwork:

@@ -476,7 +476,8 @@ def _guest_values(value: Any) -> list[Guest]:
 async def _capture_failures(guests: Iterable[Guest]) -> None:
     for guest in guests:
         try:
-            await guest.screen.capture_result("failure")
+            frame = await guest.screen.capture_result("failure")
+            frame.write_png(guest.debug_directory / "last-vnc.png")
         except BaseException:
             pass
 

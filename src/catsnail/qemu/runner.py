@@ -16,7 +16,7 @@ from pathlib import Path
 from ..graph.api import Machine
 from ..image import ImageError, resolve_iso
 from .artifacts import RunArtifacts
-from .network import NetworkAttachment, SocketAttachment
+from .network import NetworkAttachment, SocketAttachment, UserAttachment
 
 
 class QemuRunError(RuntimeError):
@@ -33,7 +33,9 @@ class QemuRunError(RuntimeError):
 class QemuNetwork:
     """QEMU network devices for one live guest.
 
-    The SLIRP control NIC forwards only the localhost control endpoint.
+    The localhost control endpoint is forwarded through a declared ``NetUser``
+    NIC when one is available. Otherwise Catsnail adds a private SLIRP NIC
+    solely for that endpoint.
     """
 
     control_port: int
@@ -97,7 +99,11 @@ class QemuRunner:
             )
         elif machine.disk is not None:
             command.extend(["-drive", f"file={machine.disk},if=virtio"])
-        if network is not None:
+        control_on_user_nic = network is not None and any(
+            isinstance(attachment, UserAttachment)
+            for attachment in network_attachments
+        )
+        if network is not None and not control_on_user_nic:
             host_forwards = [f"hostfwd=tcp:127.0.0.1:{network.control_port}-:8123"]
             command.extend(
                 [
@@ -109,6 +115,7 @@ class QemuRunner:
             )
         socket_index = 0
         user_index = 0
+        control_forwarded = False
         for attachment in network_attachments:
             if isinstance(attachment, SocketAttachment):
                 netdev_id = f"socket{socket_index}"
@@ -126,10 +133,16 @@ class QemuRunner:
             else:
                 netdev_id = f"user{user_index}"
                 user_index += 1
+                options = [f"id={netdev_id}", f"net={attachment.subnet}"]
+                if network is not None and not control_forwarded:
+                    options.append(
+                        f"hostfwd=tcp:127.0.0.1:{network.control_port}-:8123"
+                    )
+                    control_forwarded = True
                 command.extend(
                     [
                         "-netdev",
-                        f"user,id={netdev_id},net={attachment.subnet}",
+                        "user," + ",".join(options),
                         "-device",
                         f"virtio-net-pci,id=catsnail-{netdev_id},netdev={netdev_id},mac={attachment.mac}",
                     ]

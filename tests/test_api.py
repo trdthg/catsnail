@@ -120,9 +120,18 @@ def test_add_net_validates_user_and_socket_backends() -> None:
     assert socket_network.subnet == "192.168.76.0/24"
     assert isinstance(user_network.backend, NetUser)
     assert user_network.subnet is None
+    assert user_network.declaration.endswith(":user_network")
 
     with pytest.raises(GraphDefinitionError, match="unsupported network backend"):
         add_net(cast(Any, object()))
+
+
+def test_os_source_identity_uses_its_assignment_name() -> None:
+    first = add_os(Machine())
+    second = add_os(Machine())
+
+    assert first.declaration.endswith(":first")
+    assert second.declaration.endswith(":second")
 
 
 def test_projects_a_tuple_checkpoint_into_separate_guest_parameters() -> None:

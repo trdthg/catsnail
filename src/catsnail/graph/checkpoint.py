@@ -16,6 +16,12 @@ from typing import Any, Iterable, Mapping
 from .api import Machine, Node, Source, TestNode
 
 
+# QEMU device topology is part of a migration-state ABI. Increment this when
+# Catsnail changes the command line in a way that prevents old VM snapshots
+# from being resumed safely.
+CHECKPOINT_FORMAT = 3
+
+
 class CheckpointError(RuntimeError):
     """Raised when a durable checkpoint is missing or malformed."""
 
@@ -231,7 +237,10 @@ def checkpoint_key(node: TestNode[Any]) -> str:
         return payload
 
     encoded = json.dumps(
-        describe(node), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        {"format": CHECKPOINT_FORMAT, "node": describe(node)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 

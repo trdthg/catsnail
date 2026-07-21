@@ -6,7 +6,20 @@ import zlib
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from catsnail.qemu.vnc import Frame, VncClient, _png_chunk, _typing_key
+
+
+class _Writer:
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+
+    def write(self, _: bytes) -> None:
+        self.writes.append(_)
+
+    async def drain(self) -> None:
+        return None
 
 
 def test_typing_key_uses_explicit_shift_for_shell_punctuation() -> None:
@@ -70,6 +83,73 @@ def test_vnc_keeps_unchanged_pixels_across_partial_updates() -> None:
 
     frame = asyncio.run(exercise())
     assert frame.rgba == bytes([255, 0, 0, 0, 0, 255, 0, 0])
+
+
+def test_vnc_frame_returns_the_latest_queued_update() -> None:
+    async def exercise() -> Frame:
+        reader = asyncio.StreamReader()
+        client = VncClient(reader, cast(asyncio.StreamWriter, _Writer()))
+        client.width = 1
+        client.height = 1
+        client._framebuffer = bytearray(4)
+        reader.feed_data(
+            b"\x00"
+            + b"\x00"
+            + struct.pack(">H", 1)
+            + struct.pack(">HHHHi", 0, 0, 1, 1, 0)
+            + bytes([255, 0, 0, 0])
+            + b"\x00"
+            + b"\x00"
+            + struct.pack(">H", 1)
+            + struct.pack(">HHHHi", 0, 0, 1, 1, 0)
+            + bytes([0, 255, 0, 0])
+        )
+        return await client.frame(timeout=1)
+
+    frame = asyncio.run(exercise())
+
+    assert frame.rgba == bytes([0, 255, 0, 0])
+
+
+def test_vnc_click_holds_the_button_until_the_next_compositor_tick() -> None:
+    async def exercise() -> list[bytes]:
+        writer = _Writer()
+        client = VncClient(asyncio.StreamReader(), cast(asyncio.StreamWriter, writer))
+        client.width = 1280
+        client.height = 800
+        await client.click(10, 20)
+        return writer.writes
+
+    writes = asyncio.run(exercise())
+
+    assert writes == [
+        struct.pack(">BBHH", 5, 1, 10, 20),
+        struct.pack(">BBHH", 5, 0, 10, 20),
+    ]
+
+
+def test_vnc_press_holds_a_key_through_one_controller_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> tuple[list[bytes], list[float]]:
+        writer = _Writer()
+        client = VncClient(asyncio.StreamReader(), cast(asyncio.StreamWriter, writer))
+        delays: list[float] = []
+
+        async def record_delay(seconds: float) -> None:
+            delays.append(seconds)
+
+        monkeypatch.setattr("catsnail.qemu.vnc.asyncio.sleep", record_delay)
+        await client.press(ord("x"))
+        return writer.writes, delays
+
+    writes, delays = asyncio.run(exercise())
+
+    assert writes == [
+        struct.pack(">BBHI", 4, 1, 0, ord("x")),
+        struct.pack(">BBHI", 4, 0, 0, ord("x")),
+    ]
+    assert delays == [0.01]
 
 
 def test_vnc_applies_a_desktop_resize_before_raw_pixels() -> None:

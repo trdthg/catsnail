@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -17,6 +19,7 @@ from catsnail.guest import (
     GuestNetwork,
     NetworkInterface,
 )
+from catsnail.guest.debian import TerminalCommand
 from catsnail.qemu.vnc import Frame, VncClient
 
 
@@ -70,6 +73,13 @@ class _TerminalCommand:
     async def output(self, *, timeout: float) -> str:
         del timeout
         return "2: enp0s8    inet 192.168.76.10/24" if self._capture_output else ""
+
+    async def wait_for_output(
+        self, expected: tuple[str, ...], *, deadline: float
+    ) -> None:
+        del deadline
+        output = await self.output(timeout=0)
+        assert all(fragment in output for fragment in expected)
 
 
 class _Serial:
@@ -203,6 +213,136 @@ def test_debian_adapter_runs_an_arbitrary_administrator_command() -> None:
         "sudo -n true",
         "sudo -n -- sh -c 'apt-get update && apt-get install --yes openssh-server'",
     ]
+
+
+def test_debian_terminal_asserts_captured_command_output() -> None:
+    guest, terminal, _ = _linux_guest()
+
+    asyncio.run(
+        _debian(guest, terminal).terminal.assert_output(
+            "ip -o -4 addr show",
+            "2: enp0s8    inet 192.168.76.10/24\n",
+        )
+    )
+
+    assert terminal.commands == ["ip -o -4 addr show"]
+
+
+def test_debian_terminal_reports_output_assertion_mismatches() -> None:
+    guest, terminal, _ = _linux_guest()
+
+    with pytest.raises(
+        GuestControlError,
+        match=re.compile("expected: 'missing'.*actual: '2: enp0s8", re.DOTALL),
+    ):
+        asyncio.run(
+            _debian(guest, terminal).terminal.assert_output(
+                "ip -o -4 addr show",
+                "missing",
+            )
+        )
+
+
+def test_debian_terminal_asserts_streamed_output() -> None:
+    guest, terminal, _ = _linux_guest()
+
+    asyncio.run(
+        _debian(guest, terminal).terminal.assert_run(
+            "ip -o -4 addr show",
+            "enp0s8",
+            "192.168.76.10",
+        )
+    )
+
+    assert terminal.commands == ["ip -o -4 addr show"]
+
+
+def test_terminal_command_waits_for_output_fragments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outputs = iter(["fetching\n", "fetching\ncomplete\n"])
+    statuses = iter(["", ""])
+    steps: list[str] = []
+
+    async def read_text(url: str, *_: object, **__: object) -> str:
+        if url == "output":
+            return next(outputs, "fetching\ncomplete\n")
+        return next(statuses, "")
+
+    async def no_delay(_: float) -> None:
+        return None
+
+    async def record_step(label: str) -> None:
+        steps.append(label)
+
+    monkeypatch.setattr("catsnail.guest.debian._read_text", read_text)
+    monkeypatch.setattr("catsnail.guest.debian.asyncio.sleep", no_delay)
+    command = TerminalCommand(
+        command="build",
+        result_url="result",
+        output_url="output",
+        after_step=record_step,
+    )
+
+    asyncio.run(command.wait_for_output(("fetching", "complete"), deadline=time.monotonic() + 1))
+
+    assert steps == []
+
+
+def test_terminal_command_records_after_the_terminal_refreshes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    async def read_text(*_: object, **__: object) -> str:
+        return "0"
+
+    async def settle(delay: float) -> None:
+        assert delay == 2
+        events.append("terminal-refreshed")
+
+    async def record_step(label: str) -> None:
+        events.append(label)
+
+    monkeypatch.setattr("catsnail.guest.debian._read_text", read_text)
+    monkeypatch.setattr("catsnail.guest.debian.asyncio.sleep", settle)
+    command = TerminalCommand(
+        command="build",
+        result_url="result",
+        output_url=None,
+        after_step=record_step,
+    )
+
+    asyncio.run(command.wait())
+
+    assert events == ["terminal-refreshed", "terminal-command-complete"]
+
+
+def test_terminal_command_fails_when_output_is_missing_at_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    steps: list[str] = []
+
+    async def read_text(url: str, *_: object, **__: object) -> str:
+        return "ready\n" if url == "output" else "0"
+
+    async def record_step(label: str) -> None:
+        steps.append(label)
+
+    monkeypatch.setattr("catsnail.guest.debian._read_text", read_text)
+    command = TerminalCommand(
+        command="build",
+        result_url="result",
+        output_url="output",
+        after_step=record_step,
+    )
+
+    with pytest.raises(GuestControlError, match="completed without expected output"):
+        asyncio.run(
+            command.wait_for_output(("complete",), deadline=time.monotonic() + 1)
+        )
+
+    assert steps == ["terminal-command-complete"]
 
 
 def test_debian_adapter_initializes_serial_once_in_a_checkpoint_stage() -> None:

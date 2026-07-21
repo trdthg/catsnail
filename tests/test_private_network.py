@@ -51,3 +51,13 @@ def test_network_pool_allocates_an_isolated_user_egress_nic() -> None:
     assert attachment.subnet.startswith("10.")
     assert attachment.mac.startswith("52:54:")
     assert not isinstance(attachment, SocketAttachment)
+
+
+def test_network_pool_keeps_a_user_subnet_stable_across_executions() -> None:
+    network = add_net(NetUser())
+    first = NetworkPool().attachments_for("machine:desktop", (network,))[0]
+    second = NetworkPool().attachments_for("machine:desktop", (network,))[0]
+
+    assert isinstance(first, UserAttachment)
+    assert isinstance(second, UserAttachment)
+    assert first.subnet == second.subnet

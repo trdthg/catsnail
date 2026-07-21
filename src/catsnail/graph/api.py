@@ -6,6 +6,7 @@ separate layers so graph collection remains deterministic and easy to test.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
 from dataclasses import dataclass, field
@@ -66,6 +67,7 @@ class Network:
     """
 
     backend: NetworkBackend
+    declaration: str = "<unknown>"
 
     def __post_init__(self) -> None:
         if isinstance(self.backend, NetUser):
@@ -155,29 +157,62 @@ def add_net(backend: NetworkBackend) -> Network:
     a DHCP-configured SLIRP egress NIC.
     """
 
-    return Network(backend=backend)
+    return Network(backend=backend, declaration=_declaration_location("add_net"))
 
 
 def add_os(machine: Machine) -> Source[Guest]:
     """Register a cold VM source for use in a test function's ``use`` default."""
 
-    return Source(machine=machine, declaration=_declaration_location())
+    return Source(machine=machine, declaration=_declaration_location("add_os"))
 
 
-def _declaration_location() -> str:
-    """Return the source location of the ``add_os(...)`` declaration."""
+def _declaration_location(call_name: str) -> str:
+    """Return a stable identity for an ``add_os(...)`` declaration."""
 
     frame = inspect.currentframe()
     try:
         caller = frame.f_back.f_back if frame is not None and frame.f_back else None
         if caller is None:
             return "<unknown>"
-        return (
-            f"{Path(caller.f_code.co_filename).resolve()}:"
-            f"{caller.f_lineno}:{caller.f_lasti}"
-        )
+        path = Path(caller.f_code.co_filename).resolve()
+        name = _declaration_name(path, caller.f_lineno, call_name)
+        if name is not None:
+            return f"{path}:{name}"
+        return f"{path}:{caller.f_lineno}:{caller.f_lasti}"
     finally:
         del frame
+
+
+def _declaration_name(path: Path, line: int, call_name: str) -> str | None:
+    """Find the assignment target wrapping the current ``add_os`` call."""
+
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return None
+    for node in ast.walk(tree):
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        if not isinstance(target, ast.Name) or value is None:
+            continue
+        if _contains_declaration_call(value, line, call_name):
+            return target.id
+    return None
+
+
+def _contains_declaration_call(value: ast.expr, line: int, call_name: str) -> bool:
+    for node in ast.walk(value):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id != call_name:
+            continue
+        if node.lineno <= line <= getattr(node, "end_lineno", node.lineno):
+            return True
+    return False
 
 
 def use(node: Source[T] | TestNode[T]) -> T:

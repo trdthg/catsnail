@@ -384,6 +384,7 @@ async def _run(
     }
     completed: set[tuple[Path, str]] = set()
     running: dict[asyncio.Task[Any], tuple[Path, str]] = {}
+    report: list[tuple[str, Path, TestNode[Any], TestExecutionError | None]] = []
 
     while pending or running:
         for key, (candidate, executor, target) in list(pending.items()):
@@ -409,6 +410,7 @@ async def _run(
             key = running.pop(task)
             candidate, target, result, error = task.result()
             if error is not None:
+                report.append(("FAIL", candidate, target, error))
                 reporter.emit(event("failed", target, target=True, detail=str(error)))
                 for other in running:
                     other.cancel()
@@ -429,11 +431,13 @@ async def _run(
                         )
                     )
                 await asyncio.gather(*done, *running, return_exceptions=True)
+                _write_report(target_dir, report)
                 _print_test_failure(candidate, error)
                 return 1
             if result is None:
                 raise AssertionError(f"{target.id} completed without a result")
             completed.add(key)
+            report.append(("PASS", candidate, target, None))
             reporter.emit(
                 event(
                     "passed",
@@ -445,6 +449,7 @@ async def _run(
             if record and not reporter.live:
                 for artifacts in result.artifacts:
                     print(f"Recording: {artifacts / 'recording.mp4'}")
+    _write_report(target_dir, report)
     return 0
 
 
@@ -509,3 +514,35 @@ def _print_test_failure(path: Path, error: TestExecutionError) -> None:
         resume = artifact_directory / "resume.sh"
         if resume.is_file():
             print(f"VM snapshot reproduce: sh {resume}", file=sys.stderr)
+
+
+def _write_report(
+    target_dir: Path,
+    results: Iterable[tuple[str, Path, TestNode[Any], TestExecutionError | None]],
+) -> None:
+    """Write a compact, linkable summary for the completed run."""
+
+    rows = list(results)
+    passed = sum(status == "PASS" for status, _, _, _ in rows)
+    failed = sum(status == "FAIL" for status, _, _, _ in rows)
+    lines = [
+        "# Catsnail Report",
+        "",
+        f"{passed} passed, {failed} failed.",
+        "",
+        "| Status | Test | Details |",
+        "| --- | --- | --- |",
+    ]
+    for status, path, target, error in rows:
+        details = ""
+        if error is not None:
+            screenshot = next(
+                (directory / "last-vnc.png" for directory in error.debug if (directory / "last-vnc.png").is_file()),
+                None,
+            )
+            reproduce = f"catsnail run {path} --test {target.function.__name__}"
+            details = f"`{reproduce}`"
+            if screenshot is not None:
+                details += f"; [last VNC screenshot]({screenshot.relative_to(target_dir.parent)})"
+        lines.append(f"| {status} | `{target.function.__name__}` | {details} |")
+    (target_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

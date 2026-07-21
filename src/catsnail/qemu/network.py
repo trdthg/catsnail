@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import socket
-import uuid
 from dataclasses import dataclass
 
 from ..graph.api import GraphDefinitionError, NetSocket, Network
@@ -97,18 +96,23 @@ class NetworkPool:
             segment = (
                 SocketSegment.create(network)
                 if isinstance(network.backend, NetSocket)
-                else UserSegment(network, self._allocate_user_subnet())
+                else UserSegment(network, self._allocate_user_subnet(network))
             )
             self._segments[network] = segment
         return segment
 
-    def _allocate_user_subnet(self) -> str:
-        while True:
-            token = uuid.uuid4().bytes
-            subnet = f"10.{64 + token[0] % 128}.{token[1]}.0/24"
+    def _allocate_user_subnet(self, network: Network) -> str:
+        """Allocate a stable SLIRP subnet that survives checkpoint restores."""
+
+        digest = hashlib.sha256(network.declaration.encode("utf-8")).digest()
+        start = ((digest[0] % 128) << 8) | digest[1]
+        for offset in range(128 * 256):
+            index = (start + offset) % (128 * 256)
+            subnet = f"10.{64 + index // 256}.{index % 256}.0/24"
             if subnet not in self._user_subnets:
                 self._user_subnets.add(subnet)
                 return subnet
+        raise GraphDefinitionError("exhausted Catsnail's NetUser subnet range")
 
 
 def _network_mac(source_id: str, network: Network, index: int) -> str:
