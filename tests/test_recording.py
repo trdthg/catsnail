@@ -31,6 +31,15 @@ def test_recorder_keeps_keyframes_and_manifest_without_ffmpeg(
     assert (recorder.directory / "recording-error.txt").exists()
 
 
+def test_recorder_preserves_unicode_keyframe_labels(tmp_path: Path) -> None:
+    recorder = StepRecorder(tmp_path)
+    frame = Frame(width=1, height=1, rgba=bytes([255, 255, 255, 0]))
+
+    keyframe = recorder.add(frame, "打开新闻")
+
+    assert keyframe.name == "000001-打开新闻.png"
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
 def test_recorder_assembles_an_mp4_when_ffmpeg_is_available(tmp_path: Path) -> None:
     debug_directory = tmp_path / "debug"

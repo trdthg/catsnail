@@ -10,7 +10,7 @@ from typing import Any, cast
 import pytest
 
 from catsnail.graph.api import NetSocket, Network, add_net
-from catsnail.guest.controls import Screen
+from catsnail.guest.controls import Screen, _keysym, _minimize_button
 from catsnail.guest import (
     DebianAdapter,
     DebianSerial,
@@ -105,7 +105,9 @@ class _Guest:
     def __init__(self, network: GuestNetwork) -> None:
         self._control_url = "http://127.0.0.1:8123"
         self._running = SimpleNamespace(
-            artifacts=SimpleNamespace(serial_socket=Path("/tmp/catsnail-test-serial.sock"))
+            artifacts=SimpleNamespace(
+                serial_socket=Path("/tmp/catsnail-test-serial.sock")
+            )
         )
         self.release_directory = Path("/tmp/catsnail-test-release")
         self._close_callbacks: list[object] = []
@@ -137,8 +139,13 @@ class _Keyboard:
 
 
 class _Vnc:
-    async def frame(self) -> Frame:
+    async def frame(self, **_: object) -> Frame:
         return Frame(width=1, height=1, rgba=bytes([255, 255, 255, 0]))
+
+    async def click(self, x: int, y: int, *, button: int = 1) -> None:
+        del x, y
+        del button
+        return None
 
 
 class _ResizingVnc:
@@ -180,6 +187,29 @@ def test_core_network_reports_the_declared_private_nic() -> None:
 
     assert interface.subnet == "192.168.76.0/24"
     assert interface.mac == "52:54:00:12:34:56"
+
+
+def test_keyboard_supports_menu_navigation_keys() -> None:
+    assert _keysym("SHIFT") == 0xFFE1
+    assert _keysym("UP") == 0xFF52
+    assert _keysym("DOWN") == 0xFF54
+    assert _keysym("LEFT") == 0xFF51
+    assert _keysym("RIGHT") == 0xFF53
+    assert _keysym("F9") == 0xFFC6
+
+
+def test_locates_a_gnome_window_minimize_control() -> None:
+    width, height = 1280, 800
+    rgba = bytearray(width * height * 4)
+    for y in range(100, 140):
+        for x in range(165, 980):
+            offset = (y * width + x) * 4
+            rgba[offset : offset + 3] = b"\x1e\x1e\x1e"
+
+    assert _minimize_button(Frame(width=width, height=height, rgba=bytes(rgba))) == (
+        875,
+        100,
+    )
 
 
 def test_debian_adapter_configures_the_declared_private_nic_by_mac_address() -> None:
@@ -257,6 +287,18 @@ def test_debian_terminal_asserts_streamed_output() -> None:
     assert terminal.commands == ["ip -o -4 addr show"]
 
 
+def test_debian_terminal_captures_a_whole_compound_command() -> None:
+    guest, _, _ = _linux_guest()
+    terminal = DebianAdapter(guest).terminal
+    terminal._server_started = True
+
+    asyncio.run(terminal._send("cd project && make", timeout=30, capture_output=True))
+
+    entered = cast(_Guest, guest).keyboard.actions[0]
+    assert entered.startswith("(cd project && make) > /tmp/catsnail-result-")
+    assert ".out 2>&1; printf %s $? > /tmp/catsnail-result-" in entered
+
+
 def test_terminal_command_waits_for_output_fragments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -284,7 +326,9 @@ def test_terminal_command_waits_for_output_fragments(
         after_step=record_step,
     )
 
-    asyncio.run(command.wait_for_output(("fetching", "complete"), deadline=time.monotonic() + 1))
+    asyncio.run(
+        command.wait_for_output(("fetching", "complete"), deadline=time.monotonic() + 1)
+    )
 
     assert steps == []
 
@@ -452,28 +496,28 @@ def test_terminal_reuses_the_control_server_after_a_checkpoint_restore(
 
     asyncio.run(terminal._ensure_server(timeout=2))
 
-    assert cast(_Guest, guest).keyboard.actions == []
+    assert cast(_Guest, guest).keyboard.actions == ["shortcut-CTRL-ALT-T"]
 
 
-def test_screen_separates_release_captures_from_framework_diagnostics(
+def test_screen_exposes_a_middle_click_for_x11_primary_selection(
     tmp_path: Path,
 ) -> None:
-    debug_directory = tmp_path / "debug"
-    release_directory = tmp_path / "release"
-    debug_directory.mkdir()
-    release_directory.mkdir()
-    screen = Screen(
-        cast(VncClient, _Vnc()), debug_directory, release_directory, recorder=None
-    )
+    class _ClickVnc(_Vnc):
+        def __init__(self) -> None:
+            self.clicks: list[tuple[int, int, int]] = []
 
-    asyncio.run(screen.capture("expected-state"))
-    asyncio.run(screen.capture_result("failure"))
+        async def click(self, x: int, y: int, *, button: int = 1) -> None:
+            self.clicks.append((x, y, button))
 
-    assert (release_directory / "01-expected-state.png").is_file()
-    assert (debug_directory / "02-failure.png").is_file()
+    vnc = _ClickVnc()
+    screen = Screen(cast(VncClient, vnc), tmp_path, tmp_path, recorder=None)
+
+    asyncio.run(screen.middle_click(10, 20))
+
+    assert vnc.clicks == [(10, 20, 2)]
 
 
-def test_screen_waits_for_a_resize_before_matching_an_image(tmp_path: Path) -> None:
+def test_screen_asserts_and_publishes_an_image_after_a_resize(tmp_path: Path) -> None:
     template = tmp_path / "template.png"
     Frame(width=2, height=1, rgba=bytes([255, 255, 255, 0] * 2)).write_png(template)
     debug_directory = tmp_path / "debug"
@@ -488,7 +532,7 @@ def test_screen_waits_for_a_resize_before_matching_an_image(tmp_path: Path) -> N
     )
 
     matched = asyncio.run(
-        screen.wait_for_image(
+        screen.assert_screen(
             template,
             x=0,
             y=0,
@@ -497,6 +541,55 @@ def test_screen_waits_for_a_resize_before_matching_an_image(tmp_path: Path) -> N
     )
 
     assert (matched.width, matched.height) == (2, 1)
+    assert (release_directory / "01-template.png").is_file()
+
+
+def test_screen_snapshot_does_not_publish_an_artifact(tmp_path: Path) -> None:
+    debug_directory = tmp_path / "debug"
+    release_directory = tmp_path / "release"
+    debug_directory.mkdir()
+    release_directory.mkdir()
+    screen = Screen(
+        cast(VncClient, _Vnc()), debug_directory, release_directory, recorder=None
+    )
+
+    snapshot = asyncio.run(screen.snapshot())
+
+    assert snapshot.width == 1
+    assert not tuple(release_directory.iterdir())
+
+
+def test_screen_retains_a_failed_assertion_frame_for_debugging(tmp_path: Path) -> None:
+    expected = Frame(width=2, height=1, rgba=bytes([0, 0, 0, 0] * 2))
+    template = tmp_path / "template.png"
+    expected.write_png(template)
+    debug_directory = tmp_path / "debug"
+    release_directory = tmp_path / "release"
+    debug_directory.mkdir()
+    release_directory.mkdir()
+    screen = Screen(
+        cast(VncClient, _Vnc()), debug_directory, release_directory, recorder=None
+    )
+
+    with pytest.raises(GuestControlError, match="screen assertion failed"):
+        asyncio.run(
+            screen.assert_screen(
+                template,
+                x=0,
+                y=0,
+                timeout=0,
+            )
+        )
+
+    assert (debug_directory / "01-screen-assertion-failed.png").is_file()
+
+
+def test_screen_exposes_a_single_publishing_visual_assertion_api() -> None:
+    assert callable(Screen.assert_screen)
+    assert callable(Screen.snapshot)
+    assert not hasattr(Screen, "assert_image")
+    assert not hasattr(Screen, "wait_for_image")
+    assert not hasattr(Screen, "capture")
 
 
 def test_debian_adapter_rejects_an_address_outside_the_private_subnet() -> None:

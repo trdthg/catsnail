@@ -50,7 +50,7 @@ XFCE_PANEL = Path(__file__).parent / "assets" / "xfce-panel.png"
 
 @add_test
 async def test_desktop_boot(desktop: Guest = use(DEBIAN_DESKTOP)):
-    await desktop.screen.wait_for_image(
+    await desktop.screen.assert_screen(
         LIGHTDM_CREDENTIALS,
         x=589,
         y=343,
@@ -64,13 +64,13 @@ async def test_desktop_login(desktop: Guest = use(test_desktop_boot)):
     await desktop.keyboard.press("TAB")
     await desktop.keyboard.type("live")
     await desktop.keyboard.press("ENTER")
-    await desktop.screen.wait_for_image(
+    await desktop.screen.assert_screen(
         XFCE_PANEL,
         x=0,
         y=0,
         timeout=120,
+        label="desktop",
     )
-    await desktop.screen.capture("desktop")
 ```
 
 `add_os(...)` declares a cold machine. Every `@add_test` publishes its input
@@ -87,8 +87,27 @@ uv run catsnail run examples/debian_ssh.py
 ```
 
 The first run downloads the ISO once to `~/.config/catsnail/iso/` (or the XDG
-configuration directory). Screenshots and recordings are published under
+configuration directory). Every successful `assert_screen(...)` publishes its
+matching full-screen PNG, and recordings are published under
 `target/release/minimal/test_desktop_login/`.
+
+## Fast Iteration
+
+During GUI test authoring, rerun only the node being edited. Catsnail restores
+the nearest valid prerequisite checkpoint, so it does not boot the OS or repeat
+the IDE installation. `--no-record` skips the dense per-input keyframes and
+MP4 work; successful `assert_screen(...)` calls still save their verified PNGs.
+
+```bash
+uv run catsnail run integration-ubuntu/ruyisdk_ide.py \
+  --test '^测试RuyiSDK项目模板$' --no-record --progress plain
+```
+
+Write one `assert_screen(...)` for each stable UI state. It waits for the
+fixture, validates it, and writes the same matched framebuffer to release.
+When the scenario is ready for delivery, rerun it without `--no-record` to add
+the step recording and MP4. A code change invalidates only that test's
+checkpoint and descendants; unchanged prerequisites remain reusable.
 
 ## Multiple Machines
 
@@ -132,6 +151,42 @@ password entry, and remote-command assertion, is in
 Attach both `NetSocket` and `NetUser` when a test needs a private machine LAN
 and outbound internet access.
 
+## Interactive Studio
+
+When a GUI flow is still being discovered, restore a successful checkpoint and
+explore it without changing the checkpoint itself. Studio keeps a framebuffer
+after every action in `target/run/studio/<session>/`, together with an
+append-only `events.jsonl` log.
+
+```bash
+uv run catsnail studio start integration-ubuntu/ruyisdk_ide.py \
+  --from 测试RuyiSDK自动检测与安装Ruyi
+uv run catsnail studio screenshot
+uv run catsnail studio click 431 69
+uv run catsnail studio type demo
+uv run catsnail studio key ENTER
+uv run catsnail studio wait --timeout 30
+uv run catsnail studio serial --lines 80
+uv run catsnail studio emit --name ruyi-demo
+uv run catsnail studio stop
+```
+
+The commands attach to the most recently active session; pass its id as the
+first argument when more than one session is active. `screenshot`, `click`,
+`type`, `key`, and `wait` also accept `--machine` for multi-machine sessions.
+`serial` reads the latest QEMU serial output without interacting with the GUI.
+`crop` saves a selected frame region as a PNG fixture. `emit` copies the
+recorded frames and emits a reviewable Python draft plus a short Markdown
+report under `target/studio/generated/`. The draft intentionally leaves the
+original `add_os(...)` declaration for the user to connect, so Studio never
+overwrites a test file or silently changes a checked-in scenario.
+
+For an AI or editor integration, `studio start --serve` exposes the same
+operations as newline-delimited JSON on the session's Unix socket. Requests
+such as `screen.snapshot`, `screen.click`, `keyboard.type`,
+`keyboard.press`, and `screen.wait_stable` return frame paths, dimensions,
+revision numbers, and SHA-256 digests instead of embedding large base64 images.
+
 ## Serial Terminal
 
 `DebianAdapter` can enable an interactive `ttyS1` login on demand. The session
@@ -151,13 +206,36 @@ await serial.send("uname -s\n")
 await serial.expect("Linux")
 ```
 
+## Guest Commands
+
+`DebianAdapter.terminal.run(...)` requires a zero exit status.
+`assert_output(...)` compares the final standard output exactly; the
+conventional final newline is ignored, while all other whitespace remains
+significant. `assert_run(...)` polls output while the command runs and requires
+one or more fragments in their emitted order before requiring a zero exit
+status.
+
+```python
+debian = DebianAdapter(desktop)
+await debian.terminal.assert_output("id -un", "user")
+await debian.terminal.assert_run("make", "Compiling", "Build complete")
+```
+
+Catsnail captures the command output through the guest's private `/tmp`
+control endpoint. A nonzero exit status or an output mismatch includes the
+command and available output in the test failure.
+
 ## Commands
 
 ```bash
 catsnail doctor
-catsnail run PATH [--test PATTERN] [--jobs N] [--progress auto|tree|plain] [--force]
+catsnail run PATH [--test PATTERN] [--jobs N] [--progress auto|tree|plain] [--force] [--no-record]
 catsnail run PATH --dry-run
 catsnail prune PATH
+catsnail studio start PATH --from TEST
+catsnail studio screenshot [SESSION]
+catsnail studio emit [SESSION]
+catsnail studio stop [SESSION]
 ```
 
 `run` discovers Python modules recursively when given a directory; only modules
@@ -168,6 +246,8 @@ the selected dependency tree with every node in `WAIT` state. `prune` lists
 stale checkpoints scoped to the selected path and deletes them only after `y`.
 `--force` skips existing checkpoint restoration, rebuilding prerequisite
 environments and replacing their cache only after they succeed.
+`--no-record` disables per-step keyframes and MP4 generation while retaining
+the verified screenshots written by `assert_screen(...)`.
 `--test` is a Python regular expression matched against the function name and
 collected ID: `test_desktop_login` works as before, while
 `'^test_(browser|ssh).*'` selects both matching scenarios. Use `^...$` for an

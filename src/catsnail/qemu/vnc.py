@@ -41,6 +41,22 @@ class Frame:
             if self.rgba[index : index + 3] != other.rgba[index : index + 3]
         )
 
+    def crop(self, x: int, y: int, width: int, height: int) -> Frame:
+        """Return an RGB-compatible framebuffer region."""
+
+        if width <= 0 or height <= 0:
+            raise ValueError("crop width and height must be positive")
+        if x < 0 or y < 0 or x + width > self.width or y + height > self.height:
+            raise ValueError(
+                f"crop ({x}, {y}, {width}, {height}) is outside "
+                f"frame {self.width}x{self.height}"
+            )
+        rows = bytearray()
+        for row in range(y, y + height):
+            start = (row * self.width + x) * 4
+            rows.extend(self.rgba[start : start + width * 4])
+        return Frame(width=width, height=height, rgba=bytes(rows))
+
     def write_png(self, path: Path) -> None:
         """Write an 8-bit RGB PNG without requiring a third-party image library."""
 
@@ -175,6 +191,8 @@ class VncClient:
         self.width = 0
         self.height = 0
         self._framebuffer = bytearray()
+        self._extended_key_events = False
+        self._last_update_had_pixels = False
 
     @classmethod
     async def connect(cls, path: Path, timeout: float = 30.0) -> VncClient:
@@ -198,21 +216,51 @@ class VncClient:
         await self.writer.wait_closed()
 
     async def frame(self, timeout: float = 20.0) -> Frame:
-        self.writer.write(struct.pack(">BBHHHH", 3, 0, 0, 0, self.width, self.height))
-        await self.writer.drain()
-        latest = await asyncio.wait_for(
-            self._read_framebuffer_update(), timeout=timeout
-        )
-        # Keyboard and pointer events can leave several incremental updates in
-        # flight. Consume the queued tail so captures show the current desktop,
-        # rather than the first update that happened to arrive after a request.
-        # Drain already-buffered updates without another timeout so we do not
-        # cancel a protocol read in the middle of a message.
-        while cast(Any, self.reader)._buffer:
-            latest = await self._read_framebuffer_update()
+        deadline = asyncio.get_running_loop().time() + timeout
+        latest: Frame | None = None
+        had_pixels = False
+        # QEMU confirms Extended Key Event support with a framebuffer update
+        # containing only encoding -258. Ask again in that case: that reply is
+        # protocol negotiation, not a screenshot, and the framebuffer remains
+        # black until a subsequent request carries raw pixels.
+        for _ in range(2):
+            self.writer.write(
+                struct.pack(">BBHHHH", 3, 0, 0, 0, self.width, self.height)
+            )
+            await self.writer.drain()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for VNC framebuffer update")
+            latest = await asyncio.wait_for(
+                self._read_framebuffer_update(), timeout=remaining
+            )
+            had_pixels = had_pixels or self._last_update_had_pixels
+            # Keyboard and pointer events can leave several incremental updates
+            # in flight. Consume the queued tail so captures show the current
+            # desktop, rather than the first update after a request.
+            while cast(Any, self.reader)._buffer:
+                latest = await self._read_framebuffer_update()
+                had_pixels = had_pixels or self._last_update_had_pixels
+            if had_pixels:
+                return latest
+        assert latest is not None
         return latest
 
     async def key(self, keysym: int, down: bool = True) -> None:
+        keycode = _qnum_for_keysym(keysym) if self._extended_key_events else None
+        if keycode is not None:
+            self.writer.write(
+                struct.pack(
+                    ">BBHII",
+                    255,
+                    0,
+                    int(down),
+                    keysym,
+                    keycode,
+                )
+            )
+            await self.writer.drain()
+            return
         self.writer.write(struct.pack(">BBHI", 4, int(down), 0, keysym))
         await self.writer.drain()
 
@@ -225,14 +273,26 @@ class VncClient:
         await asyncio.sleep(0.01)
         await self.key(keysym, False)
 
-    async def click(self, x: int, y: int) -> None:
+    async def click(self, x: int, y: int, *, button: int = 1) -> None:
         if not (0 <= x < self.width and 0 <= y < self.height):
             raise VncError(f"pointer coordinates outside framebuffer: ({x}, {y})")
-        self.writer.write(struct.pack(">BBHH", 5, 1, x, y))
+        button_masks = {1: 1, 2: 2, 3: 4}
+        mask = button_masks.get(button)
+        if mask is None:
+            raise ValueError(f"unsupported VNC mouse button: {button}")
+        self.writer.write(struct.pack(">BBHH", 5, mask, x, y))
         await self.writer.drain()
         # Flutter/Wayland clients can drop a press-release pair delivered in
         # the same VNC write. Hold the button across one compositor tick.
         await asyncio.sleep(0.05)
+        self.writer.write(struct.pack(">BBHH", 5, 0, x, y))
+        await self.writer.drain()
+
+    async def move(self, x: int, y: int) -> None:
+        """Move the pointer without pressing a button."""
+
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            raise VncError(f"pointer coordinates outside framebuffer: ({x}, {y})")
         self.writer.write(struct.pack(">BBHH", 5, 0, x, y))
         await self.writer.drain()
 
@@ -308,9 +368,10 @@ class VncClient:
                 0,
             )
         )
-        # Request raw pixels plus the DesktopSize pseudo-encoding. Desktop
-        # guests often resize from the BIOS frame to the display-manager mode.
-        self.writer.write(struct.pack(">BBHii", 2, 0, 2, 0, -223))
+        # Request raw pixels, DesktopSize, and QEMU's extended-key protocol.
+        # The latter carries physical key codes, which SWT uses to construct
+        # text input on recent desktop sessions.
+        self.writer.write(struct.pack(">BBHiii", 2, 0, 3, 0, -223, -258))
         await self.writer.drain()
 
     async def _read_framebuffer_update(self) -> Frame:
@@ -334,6 +395,7 @@ class VncClient:
         # request. Preserve pixels from the prior update so recordings always
         # contain a complete desktop rather than a top-left update rectangle.
         rgba = bytearray(self._framebuffer)
+        self._last_update_had_pixels = False
         for _ in range(rectangle_count):
             x, y, width, height, encoding = struct.unpack(
                 ">HHHHi", await self.reader.readexactly(12)
@@ -342,8 +404,12 @@ class VncClient:
                 self.width, self.height = width, height
                 rgba = bytearray(width * height * 4)
                 continue
+            if encoding == -258:
+                self._extended_key_events = True
+                continue
             if encoding != 0:
                 raise VncError(f"unsupported framebuffer encoding: {encoding}")
+            self._last_update_had_pixels = True
             payload = await self.reader.readexactly(width * height * 4)
             for row in range(height):
                 source = row * width * 4
@@ -397,6 +463,40 @@ def _typing_key(character: str) -> tuple[str, bool]:
     if ord(character) < 128:
         return character, False
     raise VncError(f"VNC text input only supports ASCII: {character!r}")
+
+
+def _qnum_for_keysym(keysym: int) -> int | None:
+    """Return QEMU's XT key number for common US-layout VNC keysyms."""
+
+    if 0 <= keysym < 128:
+        return _US_QNUM.get(chr(keysym))
+    special = {
+        0xFF08: 0x0E,  # Backspace
+        0xFF09: 0x0F,  # Tab
+        0xFF0D: 0x1C,  # Enter
+        0xFF1B: 0x01,  # Escape
+        0xFFE1: 0x2A,  # Left Shift
+        0xFFE3: 0x1D,  # Left Control
+        0xFFE9: 0x38,  # Left Alt
+        0xFF51: 0xCB,  # Left
+        0xFF52: 0xC8,  # Up
+        0xFF53: 0xCD,  # Right
+        0xFF54: 0xD0,  # Down
+    }
+    if 0xFFBE <= keysym <= 0xFFC9:
+        return 0x3B + keysym - 0xFFBE
+    return special.get(keysym)
+
+
+_US_QNUM = {
+    **dict(zip("1234567890-=", range(0x02, 0x0E))),
+    **dict(zip("qwertyuiop[]", range(0x10, 0x1C))),
+    **dict(zip("asdfghjkl;'", range(0x1E, 0x29))),
+    "`": 0x29,
+    "\\": 0x2B,
+    **dict(zip("zxcvbnm,./", range(0x2C, 0x36))),
+    " ": 0x39,
+}
 
 
 def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:

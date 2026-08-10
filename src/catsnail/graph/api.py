@@ -95,6 +95,7 @@ class Machine:
     iso: Path | str | None = None
     sha256: str | None = None
     disk: Path | None = None
+    disk_size: str = "8G"
     memory: str = "1G"
     vcpus: int = 1
     display: str = "none"
@@ -104,6 +105,8 @@ class Machine:
     def __post_init__(self) -> None:
         if self.vcpus < 1:
             raise GraphDefinitionError("machine vcpus must be at least 1")
+        if not self.disk_size.strip():
+            raise GraphDefinitionError("machine disk_size must not be empty")
         if self.iso is not None and self.disk is not None:
             raise GraphDefinitionError("machine may use either iso or disk, not both")
         if isinstance(self.iso, str):

@@ -74,8 +74,10 @@ class QmpClient:
                 detail = message["error"].get("desc", message["error"])
                 raise QmpError(f"QMP {command} failed: {detail}")
 
-    async def pause_and_save(self, state_path: Path, *, drive_id: str) -> None:
-        """Persist RAM/device state after flushing the matching QCOW2 layer."""
+    async def pause_and_save(
+        self, state_path: Path, *, drive_id: str, compress: bool = True
+    ) -> None:
+        """Persist RAM/device state after flushing its QCOW2 layer."""
 
         await self.execute("stop")
         await self._wait_for_status({"paused"})
@@ -83,6 +85,11 @@ class QmpClient:
             "human-monitor-command",
             {"command-line": f"flush {drive_id}"},
         )
+        if compress:
+            await self.execute(
+                "migrate-set-capabilities",
+                {"capabilities": [{"capability": "compress", "state": True}]},
+            )
         await self.execute("migrate", {"uri": f"file:{state_path}"})
 
         deadline = asyncio.get_running_loop().time() + 300
@@ -99,9 +106,15 @@ class QmpClient:
                 )
             await asyncio.sleep(0.1)
 
-    async def resume(self) -> None:
-        """Continue a guest restored from an incoming migration stream."""
+    async def resume(self, incoming_state: Path | None = None) -> None:
+        """Load an optional migration state, then continue the restored guest."""
 
+        if incoming_state is not None:
+            await self.execute(
+                "migrate-set-capabilities",
+                {"capabilities": [{"capability": "compress", "state": True}]},
+            )
+            await self.execute("migrate-incoming", {"uri": f"file:{incoming_state}"})
         await self._wait_for_status({"paused", "running"})
         status = await self.execute("query-status")
         if isinstance(status, dict) and status.get("status") == "paused":

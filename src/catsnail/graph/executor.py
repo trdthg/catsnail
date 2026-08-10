@@ -44,11 +44,14 @@ class TestExecutionError(RuntimeError):
         self.cause = cause
         artifacts = [guest.artifacts for guest in guests]
         debug = [guest.debug_directory for guest in guests]
+        release = [guest.release_directory for guest in guests]
         if isinstance(cause, QemuRunError):
             artifacts.append(cause.artifacts.directory)
             debug.append(cause.artifacts.debug_directory)
+            release.append(cause.artifacts.release_directory)
         self.artifacts = tuple(artifacts)
         self.debug = tuple(debug)
+        self.release = tuple(release)
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,7 @@ class GraphExecutor:
         checkpoints: CheckpointStore | None = None,
         coordinator: CheckpointCoordinator | None = None,
         reporter: EventSink | None = None,
+        artifact_prefix: Path | None = None,
     ) -> None:
         self.graph = graph
         self.target_dir = target_dir
@@ -79,6 +83,7 @@ class GraphExecutor:
         self.checkpoints = checkpoints or CheckpointStore(target_dir)
         self.coordinator = coordinator or CheckpointCoordinator()
         self.reporter = reporter
+        self.artifact_prefix = artifact_prefix
 
     def targets(self, selection: str | None = None) -> list[TestNode[Any]]:
         return select_test_targets(self.graph, selection)
@@ -188,8 +193,8 @@ class GraphExecutor:
                 self._emit(event("failed", active_node, detail=str(error)))
             guests = [runtime.guest for runtime in runtimes.values()]
             await _capture_failures(guests)
-            _write_failure_details(guests, error)
             await self._save_failure_states(runtimes.values())
+            _write_failure_details(guests, error)
             raise TestExecutionError(target, error, guests) from error
         finally:
             for runtime in reversed(list(runtimes.values())):
@@ -357,7 +362,11 @@ class GraphExecutor:
         return await self.session.start(
             source,
             network_pool=network_pool,
-            relative_directory=_artifact_directory(target, source, stage),
+            relative_directory=(
+                (self.artifact_prefix / _artifact_directory(target, source, stage))
+                if self.artifact_prefix is not None
+                else _artifact_directory(target, source, stage)
+            ),
             backing=backing,
             incoming_state=incoming_state,
         )
@@ -476,8 +485,9 @@ def _guest_values(value: Any) -> list[Guest]:
 async def _capture_failures(guests: Iterable[Guest]) -> None:
     for guest in guests:
         try:
-            frame = await guest.screen.capture_result("failure")
+            frame = await guest.screen._capture_diagnostic("failure")
             frame.write_png(guest.debug_directory / "last-vnc.png")
+            frame.write_png(guest.release_directory / "failure.png")
         except BaseException:
             pass
 
@@ -489,6 +499,16 @@ def _write_failure_details(guests: Iterable[Guest], error: BaseException) -> Non
             (guest.debug_directory / "failure.txt").write_text(
                 detail + "\n", encoding="utf-8"
             )
+            guest.release_directory.mkdir(parents=True, exist_ok=True)
+            (guest.release_directory / "failure.txt").write_text(
+                detail + "\n", encoding="utf-8"
+            )
+            for source, name in (
+                (guest.artifacts / "serial.log", "serial.log"),
+                (guest.artifacts / "qemu.stderr.log", "qemu.stderr.log"),
+            ):
+                if source.is_file():
+                    shutil.copy2(source, guest.release_directory / name)
         except OSError:
             pass
 
@@ -555,7 +575,7 @@ def _safe_component(value: str) -> str:
     return (
         "".join(
             character
-            if character.isascii() and (character.isalnum() or character in "-_")
+            if character.isalnum() or character in "-_"
             else "_"
             for character in value
         )

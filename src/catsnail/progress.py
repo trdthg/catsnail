@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import curses
 import os
 import shutil
 import sys
@@ -109,9 +110,7 @@ class ProgressReporter:
             raise ValueError(f"unsupported progress mode {mode!r}")
         self._stream = stream or sys.stdout
         self._live = mode == "tree" or (
-            mode == "auto"
-            and self._stream.isatty()
-            and os.environ.get("TERM", "") not in {"", "dumb"}
+            mode == "auto" and _supports_live_tree(self._stream)
         )
         self._color = self._live and "NO_COLOR" not in os.environ
         self._nodes = _unique_nodes(nodes)
@@ -242,6 +241,18 @@ class ProgressReporter:
     def _write(self, message: str) -> None:
         self._stream.write(message)
         self._stream.flush()
+
+
+def _supports_live_tree(stream: TextIO) -> bool:
+    """Return whether the active terminal can redraw an ANSI tree in place."""
+
+    if not stream.isatty() or os.environ.get("TERM", "") in {"", "dumb"}:
+        return False
+    try:
+        curses.setupterm(fd=stream.fileno())
+        return curses.tigetstr("cuu1") is not None and curses.tigetstr("el") is not None
+    except (AttributeError, OSError, ValueError, curses.error):
+        return False
 
 
 def _unique_nodes(nodes: Sequence[TestNode[Any]]) -> list[TestNode[Any]]:

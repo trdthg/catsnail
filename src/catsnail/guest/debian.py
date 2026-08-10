@@ -137,9 +137,7 @@ class DebianTerminal:
         write one. Other whitespace remains significant.
         """
 
-        actual = (await self.output(command, admin=admin, timeout=timeout)).rstrip(
-            "\n"
-        )
+        actual = (await self.output(command, admin=admin, timeout=timeout)).rstrip("\n")
         expected = expected.rstrip("\n")
         if actual != expected:
             raise GuestControlError(
@@ -187,9 +185,7 @@ class DebianTerminal:
         assert password is not None
         password_required = await self._requires_password(timeout=timeout)
         result = await self._send(
-            self._adapter._admin_command(
-                command, password_required=password_required
-            ),
+            self._adapter._admin_command(command, password_required=password_required),
             timeout=timeout,
             capture_output=capture_output,
         )
@@ -232,7 +228,9 @@ class DebianTerminal:
         rendered = command
         output_url: str | None = None
         if capture_output:
-            rendered = f"{command} > /tmp/{token}.out 2>&1"
+            # Shell redirection binds only to the final simple command. Group
+            # the caller's expression so ``a && b`` captures both commands.
+            rendered = f"({command}) > /tmp/{token}.out 2>&1"
             output_url = f"{self._control_url}/{token}.out"
         await self._keyboard.type(f"{rendered}; printf %s $? > /tmp/{token}")
         await self._keyboard.press("ENTER")
@@ -256,6 +254,11 @@ class DebianTerminal:
         except GuestControlError:
             pass
         else:
+            # The HTTP server survives snapshot restoration, but the terminal
+            # window that started it is normally behind the restored GUI. A
+            # fresh terminal owns keyboard focus for the next command without
+            # disturbing the reusable server process.
+            await self.focus()
             self._server_started = True
             return
         probe_timeout = min(timeout, 5.0)

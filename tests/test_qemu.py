@@ -297,6 +297,9 @@ def test_resume_command_replaces_an_existing_incoming_state(tmp_path: Path) -> N
     content = script.read_text(encoding="utf-8")
     assert "old.state" not in content
     assert "new state" in content
+    assert '"cont"' in content
+    assert 'if "return" in response' in content
+    assert 'execute("query-status")' in content
 
 
 @pytest.mark.skipif(
@@ -352,7 +355,13 @@ def test_saves_and_restores_qemu_migration_state(tmp_path: Path) -> None:
         state = tmp_path / "saved.state"
         qmp = await QmpClient.connect(first.qmp_socket)
         try:
-            await qmp.pause_and_save(state, drive_id="catsnail-state")
+            # Existing checkpoints use an uncompressed stream. The deferred
+            # receiver must continue to restore them after compression lands.
+            await qmp.pause_and_save(
+                state,
+                drive_id="catsnail-state",
+                compress=False,
+            )
         finally:
             await qmp.close()
         await runner.stop(running)
@@ -371,7 +380,58 @@ def test_saves_and_restores_qemu_migration_state(tmp_path: Path) -> None:
         )
         qmp = await QmpClient.connect(second.qmp_socket)
         try:
-            await qmp.resume()
+            await qmp.resume(state)
+            status = await qmp.execute("query-status")
+            assert status["status"] == "running"
+        finally:
+            await qmp.close()
+        await runner.stop(restored)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.skipif(
+    shutil.which("qemu-system-x86_64") is None or shutil.which("qemu-img") is None,
+    reason="QEMU and qemu-img are required for compressed checkpoint integration",
+)
+def test_saves_and_restores_a_compressed_qemu_migration_state(tmp_path: Path) -> None:
+    runner = QemuRunner()
+
+    async def exercise() -> None:
+        first = RunArtifacts.create(
+            tmp_path / "target", relative_directory=Path("first")
+        )
+        first_disk = await runner.create_overlay(first.directory / "state.qcow2", first)
+        running = await runner.start(
+            Machine(memory="128M"),
+            first,
+            state_disk=first_disk,
+        )
+        state = tmp_path / "saved.state"
+        qmp = await QmpClient.connect(first.qmp_socket)
+        try:
+            await qmp.pause_and_save(state, drive_id="catsnail-state")
+        finally:
+            await qmp.close()
+        await runner.stop(running)
+
+        assert state.stat().st_size < 128 * 1024 * 1024
+
+        second = RunArtifacts.create(
+            tmp_path / "target", relative_directory=Path("second")
+        )
+        second_disk = await runner.create_overlay(
+            second.directory / "state.qcow2", second, backing=first_disk
+        )
+        restored = await runner.start(
+            Machine(memory="128M"),
+            second,
+            state_disk=second_disk,
+            incoming_state=state,
+        )
+        qmp = await QmpClient.connect(second.qmp_socket)
+        try:
+            await qmp.resume(state)
             status = await qmp.execute("query-status")
             assert status["status"] == "running"
         finally:

@@ -21,6 +21,7 @@ from catsnail.graph.executor import (
     GraphExecutor,
     TestExecutionError as CatsnailTestExecutionError,
     _artifact_directory,
+    _safe_component,
 )
 from catsnail.qemu.artifacts import RunArtifacts
 from catsnail.qemu.runner import QemuProcess, QemuRunError
@@ -148,6 +149,35 @@ def test_publishes_and_loads_a_complete_checkpoint(tmp_path: Path) -> None:
 
     assert published["directory"] == store.root / "test_desktop_login-aaaaaaaaaaaa"
     assert store.load(key, name=name) == published
+
+
+def test_checkpoint_and_artifact_names_preserve_unicode_identifiers(
+    tmp_path: Path,
+) -> None:
+    store = CheckpointStore(tmp_path / "target")
+    key = "f" * 64
+    name = "test_打开新闻"
+    staging = store.staging_directory(key, name=name)
+    (staging / "desktop.qcow2").write_bytes(b"disk")
+    (staging / "desktop.state").write_bytes(b"state")
+    published = store.publish(
+        key,
+        staging,
+        {
+            "machines": [
+                {
+                    "source": "machine:desktop",
+                    "disk": "desktop.qcow2",
+                    "state": "desktop.state",
+                }
+            ],
+            "output": {"kind": "guest", "source": "machine:desktop"},
+        },
+        name=name,
+    )
+
+    assert published["directory"] == store.root / "test_打开新闻-ffffffffffff"
+    assert _safe_component("test_打开新闻") == "test_打开新闻"
 
 
 def test_prunes_legacy_result_only_entries(tmp_path: Path) -> None:

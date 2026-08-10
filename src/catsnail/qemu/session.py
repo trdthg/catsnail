@@ -63,6 +63,7 @@ class QemuSession:
             state_disk,
             artifacts,
             backing=backing if backing is not None else source.machine.disk,
+            size=source.machine.disk_size,
         )
         network_attachments = network_pool.attachments_for(
             source.id, source.machine.networks
@@ -78,7 +79,7 @@ class QemuSession:
         )
         try:
             if incoming_state is not None:
-                await self._resume(restored=running)
+                await self._resume(restored=running, incoming_state=incoming_state)
             vnc = await VncClient.connect(artifacts.vnc_socket, timeout=60)
             if source.machine.iso is not None and incoming_state is None:
                 await _apply_boot_args(vnc, source.machine.boot_args)
@@ -144,10 +145,12 @@ class QemuSession:
                 # failure. Existing screenshots and logs still remain useful.
                 continue
 
-    async def _resume(self, *, restored: QemuProcess) -> None:
+    async def _resume(
+        self, *, restored: QemuProcess, incoming_state: Path | None = None
+    ) -> None:
         qmp = await QmpClient.connect(restored.artifacts.qmp_socket, timeout=60)
         try:
-            await qmp.resume()
+            await qmp.resume(incoming_state)
         finally:
             await qmp.close()
 

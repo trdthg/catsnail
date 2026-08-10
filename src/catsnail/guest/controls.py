@@ -70,17 +70,13 @@ class Screen:
         directory.mkdir(parents=True, exist_ok=True)
         self._release_directory = directory
 
-    async def capture(self, label: str = "screen") -> Frame:
-        frame = await self._vnc.frame()
-        self._capture_index += 1
-        frame.write_png(
-            self._release_directory / f"{self._capture_index:02d}-{label}.png"
-        )
-        self._record(frame, label)
-        return frame
+    async def snapshot(self) -> Frame:
+        """Read the current framebuffer without publishing an artifact."""
 
-    async def capture_result(self, label: str) -> Frame:
-        """Save a framework diagnostic screenshot outside the release output."""
+        return await self._vnc.frame()
+
+    async def _capture_diagnostic(self, label: str) -> Frame:
+        """Keep a framework-only diagnostic frame out of the release output."""
 
         frame = await self._vnc.frame()
         self._save(frame, label)
@@ -90,6 +86,25 @@ class Screen:
     async def click(self, x: int, y: int) -> None:
         await self._vnc.click(x, y)
         await self.record_step("screen-click")
+
+    async def middle_click(self, x: int, y: int) -> None:
+        """Click the middle mouse button at a screen coordinate."""
+
+        await self._vnc.click(x, y, button=2)
+        await self.record_step("screen-middle-click")
+
+    async def move(self, x: int, y: int) -> None:
+        """Move the pointer over a guest UI control without clicking it."""
+
+        await self._vnc.move(x, y)
+        await self.record_step("screen-move")
+
+    async def minimize_active_window(self) -> None:
+        """Minimize the focused GNOME window without depending on its position."""
+
+        frame = await self._vnc.frame()
+        x, y = _minimize_button(frame)
+        await self.click(x, y)
 
     async def record_step(self, label: str) -> None:
         if self._recorder is None:
@@ -115,7 +130,7 @@ class Screen:
                 )
             await asyncio.sleep(0.5)
 
-    async def wait_for_image(
+    async def assert_screen(
         self,
         template_path: Path,
         *,
@@ -123,8 +138,14 @@ class Screen:
         y: int,
         maximum_mean_difference: float = 12.0,
         timeout: float,
+        label: str | None = None,
     ) -> Frame:
-        """Wait for a screenshot region to match a fixture PNG image."""
+        """Wait for a fixture region, then publish the matching full screen.
+
+        Every successful visual assertion writes its exact matching framebuffer
+        to the release directory. ``label`` controls that artifact name; the
+        fixture filename is used when it is omitted.
+        """
 
         template = Frame.read_png(template_path)
         deadline = asyncio.get_running_loop().time() + timeout
@@ -132,15 +153,14 @@ class Screen:
         difference = float("inf")
         while True:
             latest = await self._vnc.frame(timeout=min(10, max(1, timeout)))
-            if _contains_region(latest, template, x=x, y=y):
-                difference = latest.mean_absolute_difference(template, x=x, y=y)
-                if difference <= maximum_mean_difference:
-                    self._record(latest, "image-match")
-                    return latest
+            difference = _image_difference(latest, template, x=x, y=y)
+            if difference <= maximum_mean_difference:
+                self._publish(latest, label or template_path.stem)
+                return latest
             if asyncio.get_running_loop().time() >= deadline:
-                path = self._save(latest, "image-match-timeout")
+                path = self._save(latest, "screen-assertion-failed")
                 raise GuestControlError(
-                    f"timed out matching {template_path} at ({x}, {y}); "
+                    f"screen assertion failed for {template_path} at ({x}, {y}); "
                     f"mean difference {difference:.1f}; frame {latest.width}x{latest.height}; "
                     f"template {template.width}x{template.height}; screenshot: {path}"
                 )
@@ -150,6 +170,13 @@ class Screen:
         self._capture_index += 1
         path = self._debug_directory / f"{self._capture_index:02d}-{label}.png"
         frame.write_png(path)
+        return path
+
+    def _publish(self, frame: Frame, label: str) -> Path:
+        self._capture_index += 1
+        path = self._release_directory / f"{self._capture_index:02d}-{label}.png"
+        frame.write_png(path)
+        self._record(frame, label)
         return path
 
     def _record(self, frame: Frame, label: str) -> None:
@@ -164,6 +191,39 @@ def _contains_region(frame: Frame, template: Frame, *, x: int, y: int) -> bool:
         and x + template.width <= frame.width
         and y + template.height <= frame.height
     )
+
+
+def _image_difference(frame: Frame, template: Frame, *, x: int, y: int) -> float:
+    if not _contains_region(frame, template, x=x, y=y):
+        return float("inf")
+    return frame.mean_absolute_difference(template, x=x, y=y)
+
+
+def _minimize_button(frame: Frame) -> tuple[int, int]:
+    """Locate the minimize control in a GNOME dark window title bar."""
+
+    candidate: tuple[int, int, int] | None = None
+    for y in range(32, min(frame.height - 1, 250)):
+        positions = [x for x in range(frame.width) if _is_dark_neutral(frame, x, y)]
+        if len(positions) < 300:
+            continue
+        left, right = min(positions), max(positions)
+        width = right - left + 1
+        if width < 500:
+            continue
+        score = (width, y, right)
+        if candidate is None or score[0] > candidate[0]:
+            candidate = score
+    if candidate is None:
+        raise GuestControlError("could not locate the active window title bar")
+    _, y, right = candidate
+    return right - 104, y
+
+
+def _is_dark_neutral(frame: Frame, x: int, y: int) -> bool:
+    offset = (y * frame.width + x) * 4
+    red, green, blue = frame.rgba[offset : offset + 3]
+    return 15 <= red <= 60 and abs(red - green) <= 6 and abs(red - blue) <= 6
 
 
 @dataclass(frozen=True)
@@ -213,9 +273,7 @@ class Guest:
         self._close_callbacks: list[Callable[[], Awaitable[None]]] = []
         self._release_directory = running.artifacts.release_directory
         self._recorder = (
-            StepRecorder(running.artifacts.debug_directory)
-            if record
-            else None
+            StepRecorder(running.artifacts.debug_directory) if record else None
         )
         self.screen = Screen(
             vnc,
@@ -227,9 +285,7 @@ class Guest:
         self._control_url = f"http://127.0.0.1:{control_port}"
         self.network = GuestNetwork(interfaces)
 
-    def _register_close_callback(
-        self, callback: Callable[[], Awaitable[None]]
-    ) -> None:
+    def _register_close_callback(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._close_callbacks.append(callback)
 
     @property
@@ -269,6 +325,7 @@ def _keysym(name: str) -> int:
     keys = {
         "ALT": 0xFFE9,
         "CTRL": 0xFFE3,
+        "SHIFT": 0xFFE1,
         "ENTER": 0xFF0D,
         "ESC": 0xFF1B,
         "SUPER": 0xFFEB,
@@ -283,6 +340,10 @@ def _keysym(name: str) -> int:
     upper = name.upper()
     if upper in keys:
         return keys[upper]
+    if upper.startswith("F") and upper[1:].isdigit():
+        number = int(upper[1:])
+        if 1 <= number <= 12:
+            return 0xFFBD + number
     if len(name) == 1:
         return ord(name)
     raise ValueError(f"unsupported VNC key name: {name}")

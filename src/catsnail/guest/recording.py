@@ -109,5 +109,5 @@ class StepRecorder:
 
 
 def _slug(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    slug = re.sub(r"[^\w-]+", "-", value.lower()).strip("-")
     return slug or "step"

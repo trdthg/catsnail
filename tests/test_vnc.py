@@ -65,6 +65,31 @@ def test_frame_region_metrics(tmp_path: Path) -> None:
     assert frame.mean_absolute_difference(loaded, x=0, y=0) == 0
 
 
+def test_frame_crop_preserves_pixels_and_rejects_out_of_bounds() -> None:
+    frame = Frame(
+        width=3,
+        height=2,
+        rgba=bytes(
+            [
+                1, 2, 3, 0,
+                4, 5, 6, 0,
+                7, 8, 9, 0,
+                10, 11, 12, 0,
+                13, 14, 15, 0,
+                16, 17, 18, 0,
+            ]
+        ),
+    )
+
+    assert frame.crop(1, 0, 2, 2) == Frame(
+        width=2,
+        height=2,
+        rgba=bytes([4, 5, 6, 0, 7, 8, 9, 0, 13, 14, 15, 0, 16, 17, 18, 0]),
+    )
+    with pytest.raises(ValueError, match="outside"):
+        frame.crop(2, 1, 2, 1)
+
+
 def test_vnc_keeps_unchanged_pixels_across_partial_updates() -> None:
     async def exercise() -> Frame:
         reader = asyncio.StreamReader()
@@ -128,6 +153,80 @@ def test_vnc_click_holds_the_button_until_the_next_compositor_tick() -> None:
     ]
 
 
+def test_vnc_middle_click_uses_the_primary_selection_button() -> None:
+    async def exercise() -> list[bytes]:
+        writer = _Writer()
+        client = VncClient(asyncio.StreamReader(), cast(asyncio.StreamWriter, writer))
+        client.width = 1280
+        client.height = 800
+        await client.click(10, 20, button=2)
+        return writer.writes
+
+    assert asyncio.run(exercise()) == [
+        struct.pack(">BBHH", 5, 2, 10, 20),
+        struct.pack(">BBHH", 5, 0, 10, 20),
+    ]
+
+
+def test_vnc_requests_pixels_after_extended_key_negotiation() -> None:
+    class _WriterWithSecondRequest(_Writer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.second_request = asyncio.Event()
+
+        async def drain(self) -> None:
+            if len(self.writes) == 2:
+                self.second_request.set()
+
+    async def exercise() -> tuple[Frame, list[bytes]]:
+        reader = asyncio.StreamReader()
+        writer = _WriterWithSecondRequest()
+        client = VncClient(reader, cast(asyncio.StreamWriter, writer))
+        client.width = 1
+        client.height = 1
+        client._framebuffer = bytearray(4)
+        # QEMU first accepts encoding -258 without sending framebuffer pixels.
+        reader.feed_data(
+            b"\x00"
+            + b"\x00"
+            + struct.pack(">H", 1)
+            + struct.pack(">HHHHi", 0, 0, 0, 0, -258)
+        )
+
+        async def send_pixels() -> None:
+            await writer.second_request.wait()
+            reader.feed_data(
+                b"\x00"
+                + b"\x00"
+                + struct.pack(">H", 1)
+                + struct.pack(">HHHHi", 0, 0, 1, 1, 0)
+                + bytes([255, 0, 0, 0])
+            )
+
+        task = asyncio.create_task(send_pixels())
+        try:
+            return await client.frame(timeout=1), writer.writes
+        finally:
+            await task
+
+    frame, writes = asyncio.run(exercise())
+
+    assert frame.rgba == bytes([255, 0, 0, 0])
+    assert len(writes) == 2
+
+
+def test_vnc_move_sends_an_unpressed_pointer_event() -> None:
+    async def exercise() -> list[bytes]:
+        writer = _Writer()
+        client = VncClient(asyncio.StreamReader(), cast(asyncio.StreamWriter, writer))
+        client.width = 1280
+        client.height = 800
+        await client.move(10, 20)
+        return writer.writes
+
+    assert asyncio.run(exercise()) == [struct.pack(">BBHH", 5, 0, 10, 20)]
+
+
 def test_vnc_press_holds_a_key_through_one_controller_tick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -150,6 +249,21 @@ def test_vnc_press_holds_a_key_through_one_controller_tick(
         struct.pack(">BBHI", 4, 0, 0, ord("x")),
     ]
     assert delays == [0.01]
+
+
+def test_vnc_uses_extended_key_events_after_qemu_acknowledges_them() -> None:
+    async def exercise() -> list[bytes]:
+        writer = _Writer()
+        client = VncClient(asyncio.StreamReader(), cast(asyncio.StreamWriter, writer))
+        client._extended_key_events = True
+        await client.key(ord("a"), True)
+        await client.key(ord("a"), False)
+        return writer.writes
+
+    assert asyncio.run(exercise()) == [
+        struct.pack(">BBHII", 255, 0, 1, ord("a"), 0x1E),
+        struct.pack(">BBHII", 255, 0, 0, ord("a"), 0x1E),
+    ]
 
 
 def test_vnc_applies_a_desktop_resize_before_raw_pixels() -> None:

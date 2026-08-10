@@ -7,6 +7,7 @@ import asyncio
 import ast
 import hashlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -55,8 +56,11 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.dry_run,
                 arguments.progress,
                 arguments.force,
+                arguments.keep_going,
             )
         )
+    if arguments.command == "studio":
+        return asyncio.run(_studio_command(arguments))
     parser.error(f"unknown command: {arguments.command}")
     return 2
 
@@ -66,6 +70,96 @@ def _parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     subcommands.add_parser("doctor", help="check local QEMU test prerequisites")
+
+    studio = subcommands.add_parser(
+        "studio", help="interactively explore a restored VM checkpoint"
+    )
+    studio_commands = studio.add_subparsers(dest="studio_command", required=True)
+    studio_start = studio_commands.add_parser(
+        "start", help="restore a checkpoint and create an interactive session"
+    )
+    studio_start.add_argument("path", type=Path)
+    studio_start.add_argument(
+        "--from", dest="checkpoint", required=True, metavar="TEST",
+        help="checkpoint test function or collected id to restore",
+    )
+    studio_start.add_argument("--target-dir", type=Path, default=Path("target"))
+    studio_start.add_argument("--session", dest="session_id")
+    studio_start.add_argument(
+        "--serve", action="store_true",
+        help="keep the restored VM open and serve JSON requests on its Unix socket",
+    )
+    studio_start.add_argument("--json", action="store_true", dest="as_json")
+
+    studio_status = studio_commands.add_parser("status", help="show a session manifest")
+    studio_status.add_argument("session_id", nargs="?")
+    studio_status.add_argument("--target-dir", type=Path, default=Path("target"))
+    studio_status.add_argument("--json", action="store_true", dest="as_json")
+
+    for command, help_text in (
+        ("screenshot", "capture the current framebuffer"),
+        ("wait", "wait until the framebuffer is stable"),
+        ("serial", "read the current serial log"),
+    ):
+        item = studio_commands.add_parser(command, help=help_text)
+        item.add_argument("session_id", nargs="?")
+        item.add_argument("--machine", default="desktop")
+        item.add_argument("--timeout", type=float, default=30.0)
+        item.add_argument("--lines", type=int, default=100)
+        item.add_argument("--target-dir", type=Path, default=Path("target"))
+        item.add_argument("--json", action="store_true", dest="as_json")
+
+    click = studio_commands.add_parser("click", help="click a guest framebuffer")
+    click.add_argument("values", nargs="+", metavar="VALUE")
+    click.add_argument("--session", dest="session_id")
+    click.add_argument("--machine", default="desktop")
+    click.add_argument("--target-dir", type=Path, default=Path("target"))
+    click.add_argument("--json", action="store_true", dest="as_json")
+
+    type_command = studio_commands.add_parser("type", help="type text into a guest")
+    type_command.add_argument("values", nargs="+", metavar="TEXT")
+    type_command.add_argument("--session", dest="session_id")
+    type_command.add_argument("--machine", default="desktop")
+    type_command.add_argument("--target-dir", type=Path, default=Path("target"))
+    type_command.add_argument("--json", action="store_true", dest="as_json")
+
+    key = studio_commands.add_parser("key", help="press a guest key")
+    key.add_argument("values", nargs="+", metavar="KEY")
+    key.add_argument("--session", dest="session_id")
+    key.add_argument("--machine", default="desktop")
+    key.add_argument("--target-dir", type=Path, default=Path("target"))
+    key.add_argument("--json", action="store_true", dest="as_json")
+
+    crop = studio_commands.add_parser("crop", help="save a frame region as a fixture")
+    crop.add_argument("values", nargs="+", metavar="VALUE")
+    crop.add_argument("--session", dest="session_id")
+    crop.add_argument("--label", default="fixture")
+    crop.add_argument("--target-dir", type=Path, default=Path("target"))
+    crop.add_argument("--json", action="store_true", dest="as_json")
+
+    emit = studio_commands.add_parser("emit", help="generate a reviewable test draft")
+    emit.add_argument("session_id", nargs="?")
+    emit.add_argument("--name", default="explore")
+    emit.add_argument("--target-dir", type=Path, default=Path("target"))
+    emit.add_argument("--json", action="store_true", dest="as_json")
+
+    finish = studio_commands.add_parser("finish", help="alias for studio emit")
+    finish.add_argument("session_id", nargs="?")
+    finish.add_argument("--name", default="explore")
+    finish.add_argument("--target-dir", type=Path, default=Path("target"))
+    finish.add_argument("--json", action="store_true", dest="as_json")
+
+    reset = studio_commands.add_parser("reset", help="restore the session checkpoint again")
+    reset.add_argument("path", type=Path)
+    reset.add_argument("--from", dest="checkpoint", required=True, metavar="TEST")
+    reset.add_argument("--session", dest="session_id")
+    reset.add_argument("--target-dir", type=Path, default=Path("target"))
+    reset.add_argument("--json", action="store_true", dest="as_json")
+
+    stop = studio_commands.add_parser("stop", help="stop an interactive session")
+    stop.add_argument("session_id", nargs="?")
+    stop.add_argument("--target-dir", type=Path, default=Path("target"))
+    stop.add_argument("--json", action="store_true", dest="as_json")
 
     prune = subcommands.add_parser(
         "prune", help="interactively remove stale checkpoints for a test path"
@@ -103,6 +197,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="rebuild prerequisites instead of restoring existing checkpoints",
     )
+    run.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="continue independent tests after a failure and report every result",
+    )
     recording = run.add_mutually_exclusive_group()
     recording.add_argument(
         "--record",
@@ -131,6 +230,110 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+async def _studio_command(arguments: Any) -> int:
+    from .studio import StudioError, StudioSession, StudioSessionStore
+
+    try:
+        if arguments.studio_command == "start":
+            session = await StudioSession.start(
+                arguments.path,
+                arguments.checkpoint,
+                target_dir=arguments.target_dir,
+                session_id=arguments.session_id,
+            )
+            result: Any = {
+                "session": session.session_id,
+                "manifest": str(session.store.manifest_path(session.session_id)),
+                "machines": sorted(session.machines),
+            }
+            if arguments.serve:
+                from .studio import StudioRpcServer
+
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                await StudioRpcServer(session).serve_forever()
+                return 0
+            await session.close_connections()
+        elif arguments.studio_command == "status":
+            store = StudioSessionStore(arguments.target_dir)
+            session_id = store.active(arguments.session_id)
+            result = store.read(session_id)
+        elif arguments.studio_command == "reset":
+            from .studio import StudioSessionStore
+
+            store = StudioSessionStore(arguments.target_dir)
+            session_id = store.active(arguments.session_id)
+            existing = await StudioSession.attach(session_id, target_dir=arguments.target_dir)
+            await existing.stop()
+            shutil.rmtree(existing.directory, ignore_errors=True)
+            session = await StudioSession.start(
+                arguments.path, arguments.checkpoint,
+                target_dir=arguments.target_dir, session_id=session_id,
+            )
+            result = {"session": session.session_id, "status": "active"}
+            await session.close_connections()
+        else:
+            command = arguments.studio_command
+            if command == "click" and arguments.session_id is None and len(arguments.values) == 3:
+                arguments.session_id = arguments.values[0]
+                arguments.values = arguments.values[1:]
+            elif command in {"type", "key"} and arguments.session_id is None and len(arguments.values) > 1:
+                arguments.session_id = arguments.values[0]
+                arguments.values = arguments.values[1:]
+            elif command == "crop" and arguments.session_id is None and len(arguments.values) == 6:
+                arguments.session_id = arguments.values[0]
+                arguments.values = arguments.values[1:]
+            session = await StudioSession.attach(
+                arguments.session_id, target_dir=arguments.target_dir
+            )
+            if arguments.studio_command == "screenshot":
+                result = await session.snapshot(machine=arguments.machine)
+            elif arguments.studio_command == "click":
+                values = list(arguments.values)
+                if len(values) != 2:
+                    raise StudioError("studio click expects X Y")
+                result = await session.click(int(values[0]), int(values[1]), machine=arguments.machine)
+            elif arguments.studio_command == "type":
+                values = list(arguments.values)
+                result = await session.type(" ".join(values), machine=arguments.machine)
+            elif arguments.studio_command == "key":
+                values = list(arguments.values)
+                if len(values) != 1:
+                    raise StudioError("studio key expects one key")
+                result = await session.key(values[0], machine=arguments.machine)
+            elif arguments.studio_command == "wait":
+                result = await session.wait_stable(timeout=arguments.timeout, machine=arguments.machine)
+            elif arguments.studio_command == "serial":
+                result = await session.serial(machine=arguments.machine, lines=arguments.lines)
+            elif arguments.studio_command == "crop":
+                values = list(arguments.values)
+                if len(values) != 5:
+                    raise StudioError("studio crop expects FRAME X Y WIDTH HEIGHT")
+                result = await session.crop(
+                    int(values[0]), int(values[1]), int(values[2]),
+                    int(values[3]), int(values[4]), label=arguments.label
+                )
+            elif arguments.studio_command in {"emit", "finish"}:
+                result = session.emit(arguments.name)
+            elif arguments.studio_command == "stop":
+                await session.stop()
+                result = {"session": session.session_id, "status": "stopped"}
+            else:
+                raise StudioError(f"unknown studio command: {arguments.studio_command}")
+            if arguments.studio_command != "stop":
+                await session.close_connections()
+        if getattr(arguments, "as_json", False):
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        elif isinstance(result, dict):
+            for key, value in result.items():
+                print(f"{key}: {value}")
+        else:
+            print(result)
+        return 0
+    except (StudioError, OSError, RuntimeError) as error:
+        print(f"catsnail studio failed: {error}", file=sys.stderr)
+        return 1
 
 
 def _doctor() -> int:
@@ -267,6 +470,7 @@ async def _run(
     dry_run: bool,
     progress: ProgressMode = "auto",
     force: bool = False,
+    keep_going: bool = False,
 ) -> int:
     if jobs < 1:
         print("--jobs must be at least 1", file=sys.stderr)
@@ -383,6 +587,7 @@ async def _run(
         for key, (candidate, _, target) in pending.items()
     }
     completed: set[tuple[Path, str]] = set()
+    failed: set[tuple[Path, str]] = set()
     running: dict[asyncio.Task[Any], tuple[Path, str]] = {}
     report: list[tuple[str, Path, TestNode[Any], TestExecutionError | None]] = []
 
@@ -412,6 +617,13 @@ async def _run(
             if error is not None:
                 report.append(("FAIL", candidate, target, error))
                 reporter.emit(event("failed", target, target=True, detail=str(error)))
+                failed.add(key)
+                if keep_going:
+                    _cancel_failed_descendants(
+                        key, pending, dependencies, scheduled, reporter, report
+                    )
+                    _print_test_failure(candidate, error)
+                    continue
                 for other in running:
                     other.cancel()
                 for _, cancelled_key in running.items():
@@ -450,7 +662,36 @@ async def _run(
                 for artifacts in result.artifacts:
                     print(f"Recording: {artifacts / 'recording.mp4'}")
     _write_report(target_dir, report)
-    return 0
+    return 1 if failed else 0
+
+
+def _cancel_failed_descendants(
+    failed_key: tuple[Path, str],
+    pending: dict[tuple[Path, str], tuple[Path, GraphExecutor, TestNode[Any]]],
+    dependencies: dict[tuple[Path, str], set[tuple[Path, str]]],
+    scheduled: dict[tuple[Path, str], tuple[Path, GraphExecutor, TestNode[Any]]],
+    reporter: ProgressReporter,
+    report: list[tuple[str, Path, TestNode[Any], TestExecutionError | None]],
+) -> None:
+    """Cancel pending targets whose checkpoint state depends on a failure."""
+
+    blocked = {failed_key}
+    while True:
+        descendants = {
+            key
+            for key, prerequisites in dependencies.items()
+            if key in pending and prerequisites & blocked
+        }
+        additions = descendants - blocked
+        if not additions:
+            break
+        blocked.update(additions)
+    for key in blocked - {failed_key}:
+        candidate, _, target = pending.pop(key)
+        reporter.emit(
+            event("cancelled", target, detail="depends on a failed test")
+        )
+        report.append(("CANCEL", candidate, target, None))
 
 
 def _discover_test_paths(path: Path) -> list[Path]:
@@ -506,9 +747,12 @@ def _print_test_failure(path: Path, error: TestExecutionError) -> None:
         f"Reproduce: catsnail run {path} --test {error.target.function.__name__}",
         file=sys.stderr,
     )
-    for artifact_directory, debug_directory in zip(error.artifacts, error.debug):
+    for artifact_directory, debug_directory, release_directory in zip(
+        error.artifacts, error.debug, error.release
+    ):
         script = artifact_directory / "reproduce.sh"
         print(f"Artifacts: {artifact_directory}", file=sys.stderr)
+        print(f"Release: {release_directory}", file=sys.stderr)
         print(f"Debug: {debug_directory}", file=sys.stderr)
         print(f"QEMU reproduce: sh {script}", file=sys.stderr)
         resume = artifact_directory / "resume.sh"
@@ -537,12 +781,16 @@ def _write_report(
         details = ""
         if error is not None:
             screenshot = next(
-                (directory / "last-vnc.png" for directory in error.debug if (directory / "last-vnc.png").is_file()),
+                (
+                    directory / "failure.png"
+                    for directory in error.release
+                    if (directory / "failure.png").is_file()
+                ),
                 None,
             )
             reproduce = f"catsnail run {path} --test {target.function.__name__}"
             details = f"`{reproduce}`"
             if screenshot is not None:
-                details += f"; [last VNC screenshot]({screenshot.relative_to(target_dir.parent)})"
+                details += f"; [failure screenshot]({screenshot.relative_to(target_dir.parent)})"
         lines.append(f"| {status} | `{target.function.__name__}` | {details} |")
     (target_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

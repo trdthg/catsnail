@@ -191,7 +191,7 @@ class CheckpointStore:
     def _directory_name(key: str, name: str) -> str:
         label = "".join(
             character
-            if character.isascii() and (character.isalnum() or character in "-_")
+            if character.isalnum() or character in "-_"
             else "_"
             for character in name
         ).strip("_")

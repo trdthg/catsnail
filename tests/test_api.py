@@ -112,6 +112,11 @@ def test_rejects_invalid_private_network_declarations() -> None:
         Network(NetSocket(subnet="192.168.76.0/24"), transport="socket")  # type: ignore[call-arg]
 
 
+def test_rejects_an_empty_runtime_disk_size() -> None:
+    with pytest.raises(GraphDefinitionError, match="disk_size"):
+        Machine(disk_size="   ")
+
+
 def test_add_net_validates_user_and_socket_backends() -> None:
     socket_network = add_net(NetSocket(subnet="192.168.76.0/24"))
     user_network = add_net(NetUser())

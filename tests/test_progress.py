@@ -116,3 +116,28 @@ def test_plain_progress_remains_append_only() -> None:
     reporter.emit(event("passed", test_boot, target=True, completed=("test_boot",)))
 
     assert stream.getvalue() == (f"RUN {test_boot.id}\nPASS test_boot (test_boot)\n")
+
+
+def test_auto_mode_uses_plain_output_without_terminal_redraw_support(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class _Tty(StringIO):
+        def isatty(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return 1
+
+    source = add_os(Machine())
+
+    @add_test
+    async def test_boot(guest: Guest = use(source)) -> None:
+        del guest
+
+    monkeypatch.setattr("catsnail.progress._supports_live_tree", lambda _: False)
+    stream = _Tty()
+    reporter = ProgressReporter([test_boot], mode="auto", stream=stream)
+    reporter.emit(event("started", test_boot, target=True))
+
+    assert not reporter.live
+    assert stream.getvalue() == f"RUN {test_boot.id}\n"

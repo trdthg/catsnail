@@ -150,7 +150,9 @@ class QemuRunner:
         if vnc:
             command.extend(["-vnc", f"unix:{artifacts.vnc_socket}"])
         if incoming_state is not None:
-            command.extend(["-incoming", f"file:{incoming_state}"])
+            # A compressed migration stream requires the destination to
+            # advertise decompression before it begins reading the file.
+            command.extend(["-incoming", "defer"])
         return command
 
     async def start(
@@ -347,10 +349,65 @@ class QemuRunner:
                 next(iterator, None)
                 continue
             command.append(argument)
-        command.extend(["-incoming", f"file:{state_path}"])
+        command.extend(["-incoming", "defer"])
         script = running.artifacts.directory / "resume.sh"
         script.write_text(
-            "#!/bin/sh\nset -eu\nexec " + shlex.join(command) + "\n",
+            "#!/bin/sh\n"
+            "set -eu\n"
+            + shlex.join(command)
+            + " &\n"
+            "qemu_pid=$!\n"
+            "trap 'kill \"$qemu_pid\" 2>/dev/null || true' EXIT INT TERM\n"
+            "python3 - "
+            + shlex.quote(str(running.artifacts.qmp_socket))
+            + " "
+            + shlex.quote(f"file:{state_path}")
+            + " <<'PY'\n"
+            "import json\n"
+            "import socket\n"
+            "import sys\n"
+            "import time\n"
+            "\n"
+            "path, incoming = sys.argv[1:]\n"
+            "deadline = time.monotonic() + 60\n"
+            "while True:\n"
+            "    try:\n"
+            "        connection = socket.socket(socket.AF_UNIX)\n"
+            "        connection.connect(path)\n"
+            "        break\n"
+            "    except OSError:\n"
+            "        if time.monotonic() >= deadline:\n"
+            "            raise\n"
+            "        time.sleep(0.1)\n"
+            "def execute(command, arguments=None):\n"
+            "    request = {\"execute\": command}\n"
+            "    if arguments is not None:\n"
+            "        request[\"arguments\"] = arguments\n"
+            "    connection.sendall(json.dumps(request).encode() + b'\\r\\n')\n"
+            "    file = connection.makefile(\"rb\")\n"
+            "    while True:\n"
+            "        response = json.loads(file.readline())\n"
+            "        if \"return\" in response:\n"
+            "            return response[\"return\"]\n"
+            "        if \"error\" in response:\n"
+            "            raise RuntimeError(response[\"error\"])\n"
+            "\n"
+            "execute(\"qmp_capabilities\")\n"
+            "execute(\"migrate-set-capabilities\", {\"capabilities\": [\n"
+            "    {\"capability\": \"compress\", \"state\": True}\n"
+            "]})\n"
+            "execute(\"migrate-incoming\", {\"uri\": incoming})\n"
+            "while True:\n"
+            "    status = execute(\"query-status\")\n"
+            "    if status.get(\"status\") == \"paused\":\n"
+            "        break\n"
+            "    if time.monotonic() >= deadline:\n"
+            "        raise RuntimeError(f\"QEMU did not restore: {status}\")\n"
+            "    time.sleep(0.1)\n"
+            "execute(\"cont\")\n"
+            "connection.close()\n"
+            "PY\n"
+            "wait \"$qemu_pid\"\n",
             encoding="utf-8",
         )
         script.chmod(script.stat().st_mode | stat.S_IXUSR)

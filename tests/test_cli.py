@@ -17,7 +17,10 @@ from catsnail.cli import (
     _run,
     main,
 )
-from catsnail.graph.executor import TestResult as CatsnailTestResult
+from catsnail.graph.executor import (
+    TestExecutionError as CatsnailTestExecutionError,
+    TestResult as CatsnailTestResult,
+)
 
 
 def test_discovers_python_modules_and_skips_runtime_directories(
@@ -75,6 +78,8 @@ def test_run_defaults_to_recording_and_accepts_dry_run() -> None:
     assert parser.parse_args(["run", "scenario.py", "--dry-run"]).dry_run is True
     assert parser.parse_args(["run", "scenario.py"]).force is False
     assert parser.parse_args(["run", "scenario.py", "--force"]).force is True
+    assert parser.parse_args(["run", "scenario.py"]).keep_going is False
+    assert parser.parse_args(["run", "scenario.py", "--keep-going"]).keep_going
     assert parser.parse_args(["run", "scenario.py"]).progress == "auto"
     assert (
         parser.parse_args(["run", "scenario.py", "--progress", "plain"]).progress
@@ -349,6 +354,62 @@ def test_runs_checkpoint_tests_before_selected_consumers(
     assert executed == ["test_boot", "test_browser"]
 
 
+def test_keep_going_runs_independent_tests_and_cancels_failed_descendants(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "test_keep_going.py"
+    path.write_text(
+        "from catsnail import Guest, Machine, add_os, add_test, use\n"
+        "SOURCE = add_os(Machine())\n"
+        "@add_test\n"
+        "async def test_failure(guest: Guest = use(SOURCE)) -> None:\n"
+        "    return None\n"
+        "@add_test\n"
+        "async def test_cancelled(guest: Guest = use(test_failure)) -> None:\n"
+        "    return None\n"
+        "@add_test\n"
+        "async def test_independent(guest: Guest = use(SOURCE)) -> None:\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+    executed: list[str] = []
+
+    class FakeExecutor:
+        def __init__(self, graph: object, **_: object) -> None:
+            del graph
+
+        async def run(self, target: CatsnailTestNode[object]) -> CatsnailTestResult:
+            name = target.function.__name__
+            executed.append(name)
+            if name == "test_failure":
+                raise CatsnailTestExecutionError(
+                    target, RuntimeError("expected failure"), ()
+                )
+            return CatsnailTestResult(completed=(target,), artifacts=())
+
+    monkeypatch.setattr("catsnail.cli.GraphExecutor", FakeExecutor)
+
+    assert (
+        asyncio.run(
+            _run(
+                path,
+                tmp_path / "target",
+                None,
+                False,
+                jobs=1,
+                dry_run=False,
+                keep_going=True,
+            )
+        )
+        == 1
+    )
+    assert executed == ["test_failure", "test_independent"]
+    report = (tmp_path / "target" / "report.md").read_text(encoding="utf-8")
+    assert "| FAIL | `test_failure` |" in report
+    assert "| CANCEL | `test_cancelled` |" in report
+    assert "| PASS | `test_independent` |" in report
+
+
 @pytest.mark.skipif(
     shutil.which("qemu-system-x86_64") is None or shutil.which("qemu-img") is None,
     reason="QEMU and qemu-img are required for failure snapshot integration",
@@ -373,10 +434,18 @@ def test_failed_terminal_test_keeps_a_resumable_vm_state(tmp_path: Path) -> None
     failures = list((target_dir / "run").rglob("failure.state"))
     resumes = list((target_dir / "run").rglob("resume.sh"))
     screenshots = list((target_dir / "debug").rglob("last-vnc.png"))
+    released_screenshots = list((target_dir / "release").rglob("failure.png"))
+    failure_logs = list((target_dir / "release").rglob("failure.txt"))
+    serial_logs = list((target_dir / "release").rglob("serial.log"))
+    qemu_logs = list((target_dir / "release").rglob("qemu.stderr.log"))
     assert len(failures) == 1
     assert failures[0].stat().st_size > 0
     assert len(resumes) == 1
     assert len(screenshots) == 1
+    assert len(released_screenshots) == 1
+    assert len(failure_logs) == 1
+    assert len(serial_logs) == 1
+    assert len(qemu_logs) == 1
     report = (target_dir / "report.md").read_text(encoding="utf-8")
     assert "| FAIL | `test_failure` |" in report
-    assert "last VNC screenshot" in report
+    assert "failure screenshot" in report
