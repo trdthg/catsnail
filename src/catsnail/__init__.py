@@ -15,12 +15,16 @@ from .graph.api import (
 )
 from .guest.adapter import GuestAdapter
 from .guest.debian import DebianAdapter, DebianSerial
+from .guest.ubuntu import UbuntuAdapter, UbuntuWindow
+from .graph.executor import xfail
 
 __all__ = [
     "Guest",
     "DebianAdapter",
     "GuestAdapter",
     "DebianSerial",
+    "UbuntuAdapter",
+    "UbuntuWindow",
     "Machine",
     "NetSocket",
     "NetUser",
@@ -31,4 +35,5 @@ __all__ = [
     "add_os",
     "add_test",
     "use",
+    "xfail",
 ]

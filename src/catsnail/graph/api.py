@@ -145,6 +145,8 @@ class TestNode(Generic[T]):
     parameter_annotations: Mapping[str, Any]
     inputs: Mapping[str, Any]
     result_annotation: Any
+    internal: bool = False
+    expected_failure: str | None = None
 
     @property
     def id(self) -> str:
@@ -274,6 +276,8 @@ def add_test(function: Callable[[T], Awaitable[None]], /) -> TestNode[T]: ...
 def add_test(
     *,
     inputs: Mapping[str, Any] | None = None,
+    internal: bool = False,
+    expected_failure: str | None = None,
 ) -> _TestDecorator: ...
 
 
@@ -281,8 +285,13 @@ def add_test(
     function: Callable[..., Awaitable[Any]] | None = None,
     *,
     inputs: Mapping[str, Any] | None = None,
+    internal: bool = False,
+    expected_failure: str | None = None,
 ) -> Any:
     """Decorate an async test function and collect typed ``use`` dependencies."""
+
+    if expected_failure is not None and not expected_failure.strip():
+        raise GraphDefinitionError("expected_failure must describe the expected defect")
 
     def decorate(target: Callable[..., Awaitable[None]]) -> TestNode[Any]:
         if not callable(target):
@@ -315,6 +324,8 @@ def add_test(
             parameter_annotations=parameter_annotations,
             inputs=dict(inputs or {}),
             result_annotation=result_annotation,
+            internal=internal,
+            expected_failure=expected_failure,
         )
 
     if function is None:
@@ -426,7 +437,11 @@ def select_test_targets(
     executable test target unless narrowed with ``--test``.
     """
 
-    nodes = [node for node in graph.validate() if isinstance(node, TestNode)]
+    nodes = [
+        node
+        for node in graph.validate()
+        if isinstance(node, TestNode) and not node.internal
+    ]
     if selection is not None:
         try:
             pattern = re.compile(selection)

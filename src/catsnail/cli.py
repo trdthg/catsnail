@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import shutil
+import shlex
 import subprocess
 import sys
 from collections.abc import Iterable
@@ -33,9 +34,16 @@ from .graph.checkpoint import (
     checkpoint_origin,
 )
 from .graph.executor import GraphExecutor, TestExecutionError
+from .graph.scheduler import schedule_targets
+from .dashboard import Dashboard
 from .image import iso_cache_directory
-from .progress import ProgressMode, ProgressReporter, collect_test_nodes, event
+from .progress import (
+    ProgressMode,
+    ProgressReporter,
+    collect_test_nodes,
+)
 from .qemu.artifacts import RunArtifacts
+from .qemu.runner import QemuLaunchOptions, QemuRunner
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -45,20 +53,42 @@ def main(argv: list[str] | None = None) -> int:
         return _doctor()
     if arguments.command == "prune":
         return _prune(arguments.path, arguments.target_dir)
+    if arguments.command == "explore":
+        try:
+            return _explore(arguments)
+        except KeyboardInterrupt:
+            print("Catsnail explore cancelled.", file=sys.stderr)
+            return 130
     if arguments.command == "run":
-        return asyncio.run(
-            _run(
-                arguments.path,
-                arguments.target_dir,
-                arguments.test,
-                arguments.record,
-                arguments.jobs,
-                arguments.dry_run,
-                arguments.progress,
-                arguments.force,
-                arguments.keep_going,
+        try:
+            qemu_options = QemuLaunchOptions(
+                executable=arguments.qemu,
+                acceleration=arguments.accel,
+                tcg_thread=arguments.tcg_thread,
+                tcg_tb_size=arguments.tcg_tb_size,
+                hugepage_path=arguments.hugepages,
             )
-        )
+            return asyncio.run(
+                _run(
+                    arguments.path,
+                    arguments.target_dir,
+                    arguments.test,
+                    arguments.record,
+                    arguments.jobs,
+                    arguments.dry_run,
+                    arguments.progress,
+                    arguments.force,
+                    arguments.keep_going,
+                    arguments.web,
+                    arguments.web_port,
+                    qemu_options,
+                )
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        except KeyboardInterrupt:
+            print("Catsnail run cancelled.", file=sys.stderr)
+            return 130
     if arguments.command == "studio":
         return asyncio.run(_studio_command(arguments))
     parser.error(f"unknown command: {arguments.command}")
@@ -71,6 +101,30 @@ def _parser() -> argparse.ArgumentParser:
 
     subcommands.add_parser("doctor", help="check local QEMU test prerequisites")
 
+    explore = subcommands.add_parser(
+        "explore", help="ask the local Codex CLI to author a test through Studio"
+    )
+    explore.add_argument("task", type=Path, help="Markdown or text test specification")
+    explore.add_argument("scenario", type=Path, help="Catsnail Python scenario to extend")
+    explore.add_argument(
+        "--from",
+        dest="checkpoint",
+        required=True,
+        metavar="TEST",
+        help="successful @add_test checkpoint restored for exploration",
+    )
+    explore.add_argument("--target-dir", type=Path, default=Path("target"))
+    explore.add_argument(
+        "--codex",
+        default="codex",
+        help="Codex executable to invoke (default: codex from PATH)",
+    )
+    explore.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate inputs and print the Codex command without starting it",
+    )
+
     studio = subcommands.add_parser(
         "studio", help="interactively explore a restored VM checkpoint"
     )
@@ -80,16 +134,40 @@ def _parser() -> argparse.ArgumentParser:
     )
     studio_start.add_argument("path", type=Path)
     studio_start.add_argument(
-        "--from", dest="checkpoint", required=True, metavar="TEST",
+        "--from",
+        dest="checkpoint",
+        required=True,
+        metavar="TEST",
         help="checkpoint test function or collected id to restore",
     )
     studio_start.add_argument("--target-dir", type=Path, default=Path("target"))
     studio_start.add_argument("--session", dest="session_id")
-    studio_start.add_argument(
-        "--serve", action="store_true",
+    studio_transport = studio_start.add_mutually_exclusive_group()
+    studio_transport.add_argument(
+        "--serve",
+        action="store_true",
         help="keep the restored VM open and serve JSON requests on its Unix socket",
     )
+    studio_transport.add_argument(
+        "--stdio",
+        action="store_true",
+        help="keep the restored VM open and serve JSON Lines over standard input/output",
+    )
     studio_start.add_argument("--json", action="store_true", dest="as_json")
+
+    studio_mcp = studio_commands.add_parser(
+        "mcp", help="restore a checkpoint and expose it as MCP visual tools"
+    )
+    studio_mcp.add_argument("path", type=Path)
+    studio_mcp.add_argument(
+        "--from",
+        dest="checkpoint",
+        required=True,
+        metavar="TEST",
+        help="checkpoint test function or collected id to restore",
+    )
+    studio_mcp.add_argument("--target-dir", type=Path, default=Path("target"))
+    studio_mcp.add_argument("--session", dest="session_id")
 
     studio_status = studio_commands.add_parser("status", help="show a session manifest")
     studio_status.add_argument("session_id", nargs="?")
@@ -116,6 +194,34 @@ def _parser() -> argparse.ArgumentParser:
     click.add_argument("--target-dir", type=Path, default=Path("target"))
     click.add_argument("--json", action="store_true", dest="as_json")
 
+    right_click = studio_commands.add_parser(
+        "right-click", help="open a guest context menu"
+    )
+    right_click.add_argument("x", type=int)
+    right_click.add_argument("y", type=int)
+    right_click.add_argument("--session", dest="session_id")
+    right_click.add_argument("--machine", default="desktop")
+    right_click.add_argument("--target-dir", type=Path, default=Path("target"))
+    right_click.add_argument("--json", action="store_true", dest="as_json")
+
+    middle_click = studio_commands.add_parser(
+        "middle-click", help="paste the X11 primary selection into a guest control"
+    )
+    middle_click.add_argument("x", type=int)
+    middle_click.add_argument("y", type=int)
+    middle_click.add_argument("--session", dest="session_id")
+    middle_click.add_argument("--machine", default="desktop")
+    middle_click.add_argument("--target-dir", type=Path, default=Path("target"))
+    middle_click.add_argument("--json", action="store_true", dest="as_json")
+
+    move = studio_commands.add_parser("move", help="move the guest pointer")
+    move.add_argument("x", type=int)
+    move.add_argument("y", type=int)
+    move.add_argument("--session", dest="session_id")
+    move.add_argument("--machine", default="desktop")
+    move.add_argument("--target-dir", type=Path, default=Path("target"))
+    move.add_argument("--json", action="store_true", dest="as_json")
+
     type_command = studio_commands.add_parser("type", help="type text into a guest")
     type_command.add_argument("values", nargs="+", metavar="TEXT")
     type_command.add_argument("--session", dest="session_id")
@@ -123,12 +229,30 @@ def _parser() -> argparse.ArgumentParser:
     type_command.add_argument("--target-dir", type=Path, default=Path("target"))
     type_command.add_argument("--json", action="store_true", dest="as_json")
 
+    paste_command = studio_commands.add_parser(
+        "paste", help="paste text through the guest remote clipboard"
+    )
+    paste_command.add_argument("values", nargs="+", metavar="TEXT")
+    paste_command.add_argument("--session", dest="session_id")
+    paste_command.add_argument("--machine", default="desktop")
+    paste_command.add_argument("--target-dir", type=Path, default=Path("target"))
+    paste_command.add_argument("--json", action="store_true", dest="as_json")
+
     key = studio_commands.add_parser("key", help="press a guest key")
     key.add_argument("values", nargs="+", metavar="KEY")
     key.add_argument("--session", dest="session_id")
     key.add_argument("--machine", default="desktop")
     key.add_argument("--target-dir", type=Path, default=Path("target"))
     key.add_argument("--json", action="store_true", dest="as_json")
+
+    shortcut = studio_commands.add_parser(
+        "shortcut", help="send a guest keyboard shortcut"
+    )
+    shortcut.add_argument("values", nargs="+", metavar="KEY")
+    shortcut.add_argument("--session", dest="session_id")
+    shortcut.add_argument("--machine", default="desktop")
+    shortcut.add_argument("--target-dir", type=Path, default=Path("target"))
+    shortcut.add_argument("--json", action="store_true", dest="as_json")
 
     crop = studio_commands.add_parser("crop", help="save a frame region as a fixture")
     crop.add_argument("values", nargs="+", metavar="VALUE")
@@ -149,7 +273,9 @@ def _parser() -> argparse.ArgumentParser:
     finish.add_argument("--target-dir", type=Path, default=Path("target"))
     finish.add_argument("--json", action="store_true", dest="as_json")
 
-    reset = studio_commands.add_parser("reset", help="restore the session checkpoint again")
+    reset = studio_commands.add_parser(
+        "reset", help="restore the session checkpoint again"
+    )
     reset.add_argument("path", type=Path)
     reset.add_argument("--from", dest="checkpoint", required=True, metavar="TEST")
     reset.add_argument("--session", dest="session_id")
@@ -197,17 +323,25 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="rebuild prerequisites instead of restoring existing checkpoints",
     )
-    run.add_argument(
+    execution = run.add_mutually_exclusive_group()
+    execution.add_argument(
         "--keep-going",
+        dest="keep_going",
         action="store_true",
-        help="continue independent tests after a failure and report every result",
+        help="continue independent tests after a failure (default)",
+    )
+    execution.add_argument(
+        "--fail-fast",
+        dest="keep_going",
+        action="store_false",
+        help="stop all remaining tests after the first failure",
     )
     recording = run.add_mutually_exclusive_group()
     recording.add_argument(
         "--record",
         dest="record",
         action="store_true",
-        help="save step screenshots and recording.mp4 (default)",
+        help="save step screenshots and recording.mp4 for executed tests (default)",
     )
     recording.add_argument(
         "--no-record",
@@ -215,7 +349,55 @@ def _parser() -> argparse.ArgumentParser:
         action="store_false",
         help="do not save step screenshots or a recording.mp4",
     )
-    run.set_defaults(record=True)
+    web = run.add_mutually_exclusive_group()
+    web.add_argument(
+        "--web",
+        dest="web",
+        action="store_true",
+        help="serve the live local dashboard (default)",
+    )
+    web.add_argument(
+        "--no-web",
+        dest="web",
+        action="store_false",
+        help="disable the live local dashboard",
+    )
+    run.add_argument(
+        "--web-port",
+        type=int,
+        default=8765,
+        help="localhost dashboard port (uses a free port if occupied)",
+    )
+    run.add_argument(
+        "--qemu",
+        metavar="PATH",
+        default="qemu-system-x86_64",
+        help="QEMU system executable (default: qemu-system-x86_64)",
+    )
+    run.add_argument(
+        "--accel",
+        choices=("kvm", "tcg"),
+        default="kvm",
+        help="accelerator selection; KVM is the default and TCG is explicit",
+    )
+    run.add_argument(
+        "--tcg-thread",
+        choices=("single", "multi"),
+        help="TCG worker mode; requires --accel tcg",
+    )
+    run.add_argument(
+        "--tcg-tb-size",
+        type=int,
+        metavar="MIB",
+        help="TCG translation-block cache size in MiB; requires --accel tcg",
+    )
+    run.add_argument(
+        "--hugepages",
+        type=Path,
+        metavar="DIR",
+        help="allocate guest RAM from a mounted hugetlbfs directory",
+    )
+    run.set_defaults(record=True, web=True, keep_going=True)
     run.add_argument(
         "--jobs",
         type=int,
@@ -225,11 +407,39 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--progress",
         choices=("auto", "tree", "plain"),
-        default="auto",
+        default="tree",
         help="progress output: live tree for terminals, or append-only plain logs",
     )
 
     return parser
+
+
+def _explore(arguments: Any) -> int:
+    """Run a bounded Codex test-authoring session from a text specification."""
+
+    from .explore import ExploreError, author_test_with_codex
+
+    try:
+        result = author_test_with_codex(
+            arguments.task,
+            arguments.scenario,
+            arguments.checkpoint,
+            target_dir=arguments.target_dir,
+            workspace=Path.cwd(),
+            executable=arguments.codex,
+            dry_run=arguments.dry_run,
+        )
+    except ExploreError as error:
+        print(f"catsnail explore failed: {error}", file=sys.stderr)
+        return 2
+    if arguments.dry_run:
+        print("Codex command:")
+        print(shlex.join(result.command))
+        return 0
+    print(f"Studio session: {result.session}")
+    print(f"Explore prompt: {result.prompt}")
+    print(f"Codex report: {result.transcript}")
+    return result.returncode or 0
 
 
 async def _studio_command(arguments: Any) -> int:
@@ -254,7 +464,28 @@ async def _studio_command(arguments: Any) -> int:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 await StudioRpcServer(session).serve_forever()
                 return 0
+            if arguments.stdio:
+                from .studio import StudioStdioServer
+
+                await StudioStdioServer(session, ready=result).serve_forever()
+                return 0
             await session.close_connections()
+        elif arguments.studio_command == "mcp":
+            from .studio_mcp import StudioMcpServer
+
+            session = await StudioSession.start(
+                arguments.path,
+                arguments.checkpoint,
+                target_dir=arguments.target_dir,
+                session_id=arguments.session_id,
+            )
+            await StudioMcpServer(
+                session,
+                path=arguments.path,
+                checkpoint=arguments.checkpoint,
+                target_dir=arguments.target_dir,
+            ).serve_forever()
+            return 0
         elif arguments.studio_command == "status":
             store = StudioSessionStore(arguments.target_dir)
             session_id = store.active(arguments.session_id)
@@ -264,24 +495,40 @@ async def _studio_command(arguments: Any) -> int:
 
             store = StudioSessionStore(arguments.target_dir)
             session_id = store.active(arguments.session_id)
-            existing = await StudioSession.attach(session_id, target_dir=arguments.target_dir)
+            existing = await StudioSession.attach(
+                session_id, target_dir=arguments.target_dir
+            )
             await existing.stop()
             shutil.rmtree(existing.directory, ignore_errors=True)
             session = await StudioSession.start(
-                arguments.path, arguments.checkpoint,
-                target_dir=arguments.target_dir, session_id=session_id,
+                arguments.path,
+                arguments.checkpoint,
+                target_dir=arguments.target_dir,
+                session_id=session_id,
             )
             result = {"session": session.session_id, "status": "active"}
             await session.close_connections()
         else:
             command = arguments.studio_command
-            if command == "click" and arguments.session_id is None and len(arguments.values) == 3:
+            if (
+                command == "click"
+                and arguments.session_id is None
+                and len(arguments.values) == 3
+            ):
                 arguments.session_id = arguments.values[0]
                 arguments.values = arguments.values[1:]
-            elif command in {"type", "key"} and arguments.session_id is None and len(arguments.values) > 1:
+            elif (
+                command in {"type", "paste", "key", "shortcut"}
+                and arguments.session_id is None
+                and len(arguments.values) > 1
+            ):
                 arguments.session_id = arguments.values[0]
                 arguments.values = arguments.values[1:]
-            elif command == "crop" and arguments.session_id is None and len(arguments.values) == 6:
+            elif (
+                command == "crop"
+                and arguments.session_id is None
+                and len(arguments.values) == 6
+            ):
                 arguments.session_id = arguments.values[0]
                 arguments.values = arguments.values[1:]
             session = await StudioSession.attach(
@@ -293,26 +540,56 @@ async def _studio_command(arguments: Any) -> int:
                 values = list(arguments.values)
                 if len(values) != 2:
                     raise StudioError("studio click expects X Y")
-                result = await session.click(int(values[0]), int(values[1]), machine=arguments.machine)
+                result = await session.click(
+                    int(values[0]), int(values[1]), machine=arguments.machine
+                )
+            elif arguments.studio_command == "right-click":
+                result = await session.right_click(
+                    arguments.x, arguments.y, machine=arguments.machine
+                )
+            elif arguments.studio_command == "middle-click":
+                result = await session.middle_click(
+                    arguments.x, arguments.y, machine=arguments.machine
+                )
+            elif arguments.studio_command == "move":
+                result = await session.move(
+                    arguments.x, arguments.y, machine=arguments.machine
+                )
             elif arguments.studio_command == "type":
                 values = list(arguments.values)
                 result = await session.type(" ".join(values), machine=arguments.machine)
+            elif arguments.studio_command == "paste":
+                values = list(arguments.values)
+                result = await session.paste(" ".join(values), machine=arguments.machine)
             elif arguments.studio_command == "key":
                 values = list(arguments.values)
                 if len(values) != 1:
                     raise StudioError("studio key expects one key")
                 result = await session.key(values[0], machine=arguments.machine)
+            elif arguments.studio_command == "shortcut":
+                values = list(arguments.values)
+                if len(values) < 2:
+                    raise StudioError("studio shortcut expects at least two keys")
+                result = await session.shortcut(*values, machine=arguments.machine)
             elif arguments.studio_command == "wait":
-                result = await session.wait_stable(timeout=arguments.timeout, machine=arguments.machine)
+                result = await session.wait_stable(
+                    timeout=arguments.timeout, machine=arguments.machine
+                )
             elif arguments.studio_command == "serial":
-                result = await session.serial(machine=arguments.machine, lines=arguments.lines)
+                result = await session.serial(
+                    machine=arguments.machine, lines=arguments.lines
+                )
             elif arguments.studio_command == "crop":
                 values = list(arguments.values)
                 if len(values) != 5:
                     raise StudioError("studio crop expects FRAME X Y WIDTH HEIGHT")
                 result = await session.crop(
-                    int(values[0]), int(values[1]), int(values[2]),
-                    int(values[3]), int(values[4]), label=arguments.label
+                    int(values[0]),
+                    int(values[1]),
+                    int(values[2]),
+                    int(values[3]),
+                    int(values[4]),
+                    label=arguments.label,
                 )
             elif arguments.studio_command in {"emit", "finish"}:
                 result = session.emit(arguments.name)
@@ -362,9 +639,11 @@ def _doctor() -> int:
     if kvm.exists() and os.access(kvm, os.R_OK | os.W_OK):
         print("OK /dev/kvm: accessible")
     elif kvm.exists():
-        print("WARN /dev/kvm: not accessible; QEMU will fall back to TCG")
+        print("ERROR /dev/kvm: not accessible; default runs require KVM")
+        failures += 1
     else:
-        print("WARN /dev/kvm: not found; QEMU will use TCG")
+        print("ERROR /dev/kvm: not found; default runs require KVM")
+        failures += 1
 
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -376,7 +655,42 @@ def _doctor() -> int:
         else:
             print(f"OK ffmpeg: {version} ({ffmpeg})")
 
+    hugepage_path = Path("/dev/hugepages")
+    if not hugepage_path.is_dir():
+        print("WARN /dev/hugepages: hugetlbfs is not mounted")
+    elif not os.access(hugepage_path, os.R_OK | os.W_OK | os.X_OK):
+        print("WARN /dev/hugepages: hugetlbfs is not accessible")
+    else:
+        hugepage_stats = _hugepage_stats()
+        if hugepage_stats is None:
+            print("WARN /dev/hugepages: HugeTLB pool size is unavailable")
+        else:
+            total, free = hugepage_stats
+            if total == 0 or free == 0:
+                print(
+                    f"WARN /dev/hugepages: {total} pages reserved, {free} free; "
+                    "--hugepages may fail"
+                )
+            else:
+                print(f"OK /dev/hugepages: {free}/{total} pages free")
+
     return 1 if failures else 0
+
+
+def _hugepage_stats() -> tuple[int, int] | None:
+    """Read the system HugeTLB pool without requiring a procfs dependency."""
+
+    try:
+        values: dict[str, int] = {}
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            name, separator, value = line.partition(":")
+            if separator and name in {"HugePages_Total", "HugePages_Free"}:
+                values[name] = int(value.strip().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    if "HugePages_Total" not in values or "HugePages_Free" not in values:
+        return None
+    return values["HugePages_Total"], values["HugePages_Free"]
 
 
 def _tool_version(executable: str, *, argument: str = "--version") -> str | None:
@@ -470,7 +784,10 @@ async def _run(
     dry_run: bool,
     progress: ProgressMode = "auto",
     force: bool = False,
-    keep_going: bool = False,
+    keep_going: bool = True,
+    web: bool = False,
+    web_port: int = 8765,
+    qemu_options: QemuLaunchOptions | None = None,
 ) -> int:
     if jobs < 1:
         print("--jobs must be at least 1", file=sys.stderr)
@@ -491,9 +808,11 @@ async def _run(
             module = _load_module(candidate)
             graph = collect_module_tests(module)
             nodes = graph.validate()
-            test_count += sum(isinstance(node, TestNode) for node in nodes)
+            test_count += sum(
+                isinstance(node, TestNode) and not node.internal for node in nodes
+            )
             source_count += sum(isinstance(node, Source) for node in nodes)
-            current_checkpoints.update(_checkpoint_hashes(nodes))
+            current_checkpoints.update(_checkpoint_hashes(nodes, qemu_options))
             try:
                 targets = select_test_targets(graph, selection)
             except GraphDefinitionError as error:
@@ -513,7 +832,10 @@ async def _run(
             print(f"No collected test matches {selection!r}", file=sys.stderr)
             return 1
         ProgressReporter(
-            collect_test_nodes(target for _, _, target in collected), mode="plain"
+            collect_test_nodes(
+                (target for _, _, target in collected), include_internal=True
+            ),
+            mode="plain",
         ).render_graph()
         if len(paths) == 1:
             print(
@@ -538,9 +860,38 @@ async def _run(
 
     checkpoints = CheckpointStore(target_dir)
     coordinator = CheckpointCoordinator()
-    reporter = ProgressReporter(
-        collect_test_nodes(target for _, _, target in collected), mode=progress
+    # Show durable setup checkpoints in the live tree. Hiding them flattens
+    # real dependency paths and makes unrelated-looking branches misleading.
+    progress_nodes = collect_test_nodes(
+        (target for _, _, target in collected), include_internal=True
     )
+    dashboard = Dashboard(progress_nodes, port=web_port) if web else None
+    if dashboard is not None:
+        await dashboard.start()
+    # Tree mode owns an alternate terminal screen for the duration of a run.
+    # Keep the dashboard URL inside that screen rather than printing beside a
+    # cursor-redrawn tree, where a later failure would corrupt the redraw.
+    reporter = ProgressReporter(
+        progress_nodes,
+        mode=progress,
+        header=f"Dashboard: {dashboard.url}" if dashboard is not None else None,
+    )
+    if dashboard is not None and not reporter.live:
+        print(f"Dashboard: {dashboard.url}", file=sys.stderr)
+
+    def emit_progress(update: Any) -> None:
+        reporter.emit(update)
+        if dashboard is not None:
+            dashboard.emit(update)
+
+    def observe_guest(action: str, guest: Any) -> None:
+        if dashboard is None:
+            return
+        if action == "started":
+            dashboard.register_guest(guest)
+        elif action == "stopped":
+            dashboard.unregister_guest(guest)
+
     targets = [
         (
             candidate,
@@ -551,7 +902,9 @@ async def _run(
                 force=force,
                 checkpoints=checkpoints,
                 coordinator=coordinator,
-                reporter=reporter.emit,
+                reporter=emit_progress,
+                guest_observer=observe_guest,
+                qemu_options=qemu_options,
             ),
             target,
         )
@@ -559,139 +912,24 @@ async def _run(
     ]
     checkpoints.prune(current_checkpoints)
     RunArtifacts.prepare(target_dir)
-
-    async def run_target(
-        candidate: Path, executor: GraphExecutor, target: TestNode[Any]
-    ) -> tuple[Path, TestNode[Any], Any, TestExecutionError | None]:
-        reporter.emit(event("started", target, target=True))
-        try:
-            return candidate, target, await executor.run(target), None
-        except TestExecutionError as error:
-            return candidate, target, None, error
-
-    # Run all selected tests, but never race a checkpoint producer with a test
-    # that consumes it. Dependencies not selected by --test remain resolved by
-    # GraphExecutor as normal setup work for their selected consumer.
-    scheduled = {
-        (candidate, target.id): (candidate, executor, target)
-        for candidate, executor, target in targets
-    }
-    pending = dict(scheduled)
-    dependencies = {
-        key: {
-            (candidate, dependency.node.id)
-            for dependency in target.dependencies.values()
-            if isinstance(dependency.node, TestNode)
-            and (candidate, dependency.node.id) in pending
-        }
-        for key, (candidate, _, target) in pending.items()
-    }
-    completed: set[tuple[Path, str]] = set()
-    failed: set[tuple[Path, str]] = set()
-    running: dict[asyncio.Task[Any], tuple[Path, str]] = {}
-    report: list[tuple[str, Path, TestNode[Any], TestExecutionError | None]] = []
-
-    while pending or running:
-        for key, (candidate, executor, target) in list(pending.items()):
-            if len(running) == jobs:
-                break
-            if not dependencies[key].issubset(completed):
-                continue
-            running[asyncio.create_task(run_target(candidate, executor, target))] = key
-            del pending[key]
-
-        if not running:
-            raise RuntimeError("selected tests have an unresolved dependency")
-
-        done, _ = await asyncio.wait(
-            running,
-            timeout=1 if reporter.live else None,
-            return_when=asyncio.FIRST_COMPLETED,
+    try:
+        exit_code, report = await schedule_targets(
+            targets,
+            jobs=jobs,
+            keep_going=keep_going,
+            record=record,
+            reporter=reporter,
+            progress_nodes=progress_nodes,
+            emit_progress=emit_progress,
         )
-        if not done:
-            reporter.refresh()
-            continue
-        for task in done:
-            key = running.pop(task)
-            candidate, target, result, error = task.result()
-            if error is not None:
-                report.append(("FAIL", candidate, target, error))
-                reporter.emit(event("failed", target, target=True, detail=str(error)))
-                failed.add(key)
-                if keep_going:
-                    _cancel_failed_descendants(
-                        key, pending, dependencies, scheduled, reporter, report
-                    )
-                    _print_test_failure(candidate, error)
-                    continue
-                for other in running:
-                    other.cancel()
-                for _, cancelled_key in running.items():
-                    reporter.emit(
-                        event(
-                            "cancelled",
-                            scheduled[cancelled_key][2],
-                            detail="cancelled after a test failure",
-                        )
-                    )
-                for cancelled_key in pending:
-                    reporter.emit(
-                        event(
-                            "cancelled",
-                            scheduled[cancelled_key][2],
-                            detail="cancelled after a test failure",
-                        )
-                    )
-                await asyncio.gather(*done, *running, return_exceptions=True)
-                _write_report(target_dir, report)
-                _print_test_failure(candidate, error)
-                return 1
-            if result is None:
-                raise AssertionError(f"{target.id} completed without a result")
-            completed.add(key)
-            report.append(("PASS", candidate, target, None))
-            reporter.emit(
-                event(
-                    "passed",
-                    target,
-                    target=True,
-                    completed=(node.function.__name__ for node in result.completed),
-                )
-            )
-            if record and not reporter.live:
-                for artifacts in result.artifacts:
-                    print(f"Recording: {artifacts / 'recording.mp4'}")
+    finally:
+        if dashboard is not None:
+            await dashboard.close()
+        reporter.close()
+        await QemuRunner.stop_all_instances()
     _write_report(target_dir, report)
-    return 1 if failed else 0
-
-
-def _cancel_failed_descendants(
-    failed_key: tuple[Path, str],
-    pending: dict[tuple[Path, str], tuple[Path, GraphExecutor, TestNode[Any]]],
-    dependencies: dict[tuple[Path, str], set[tuple[Path, str]]],
-    scheduled: dict[tuple[Path, str], tuple[Path, GraphExecutor, TestNode[Any]]],
-    reporter: ProgressReporter,
-    report: list[tuple[str, Path, TestNode[Any], TestExecutionError | None]],
-) -> None:
-    """Cancel pending targets whose checkpoint state depends on a failure."""
-
-    blocked = {failed_key}
-    while True:
-        descendants = {
-            key
-            for key, prerequisites in dependencies.items()
-            if key in pending and prerequisites & blocked
-        }
-        additions = descendants - blocked
-        if not additions:
-            break
-        blocked.update(additions)
-    for key in blocked - {failed_key}:
-        candidate, _, target = pending.pop(key)
-        reporter.emit(
-            event("cancelled", target, detail="depends on a failed test")
-        )
-        report.append(("CANCEL", candidate, target, None))
+    _print_run_diagnostics(report)
+    return exit_code
 
 
 def _discover_test_paths(path: Path) -> list[Path]:
@@ -733,16 +971,22 @@ def _is_add_test(decorator: ast.expr) -> bool:
     )
 
 
-def _checkpoint_hashes(nodes: Iterable[Node]) -> dict[str, str]:
+def _checkpoint_hashes(
+    nodes: Iterable[Node], qemu_options: QemuLaunchOptions | None = None
+) -> dict[str, str]:
+    runtime = qemu_options.checkpoint_identity() if qemu_options is not None else None
     return {
-        checkpoint_key(node): checkpoint_origin(node)
+        checkpoint_key(node, runtime=runtime): checkpoint_origin(node)
         for node in nodes
         if isinstance(node, TestNode)
     }
 
 
-def _print_test_failure(path: Path, error: TestExecutionError) -> None:
-    print(f"catsnail run failed: {error}", file=sys.stderr)
+def _print_test_failure(
+    path: Path, error: TestExecutionError, *, expected: bool = False
+) -> None:
+    heading = "catsnail expected failure" if expected else "catsnail run failed"
+    print(f"{heading}: {error}", file=sys.stderr)
     print(
         f"Reproduce: catsnail run {path} --test {error.target.function.__name__}",
         file=sys.stderr,
@@ -760,6 +1004,16 @@ def _print_test_failure(path: Path, error: TestExecutionError) -> None:
             print(f"VM snapshot reproduce: sh {resume}", file=sys.stderr)
 
 
+def _print_run_diagnostics(
+    results: Iterable[tuple[str, Path, TestNode[Any], TestExecutionError | None]],
+) -> None:
+    """Print diagnostics only after the live progress surface has closed."""
+
+    for status, path, _, error in results:
+        if error is not None:
+            _print_test_failure(path, error, expected=status == "XFAIL")
+
+
 def _write_report(
     target_dir: Path,
     results: Iterable[tuple[str, Path, TestNode[Any], TestExecutionError | None]],
@@ -769,10 +1023,15 @@ def _write_report(
     rows = list(results)
     passed = sum(status == "PASS" for status, _, _, _ in rows)
     failed = sum(status == "FAIL" for status, _, _, _ in rows)
+    expected_failures = sum(status == "XFAIL" for status, _, _, _ in rows)
+    unexpected_passes = sum(status == "XPASS" for status, _, _, _ in rows)
     lines = [
         "# Catsnail Report",
         "",
-        f"{passed} passed, {failed} failed.",
+        (
+            f"{passed} passed, {failed} failed, {expected_failures} expected "
+            f"failures, {unexpected_passes} unexpected passes."
+        ),
         "",
         "| Status | Test | Details |",
         "| --- | --- | --- |",

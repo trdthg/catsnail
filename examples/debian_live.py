@@ -50,7 +50,7 @@ DESKTOP = add_os(
 
 @add_test
 async def test_desktop_login(desktop: Guest = use(DESKTOP)):
-    await desktop.screen.wait_for_image(
+    await desktop.screen.assert_screen(
         LIGHTDM_CREDENTIALS,
         x=589,
         y=343,
@@ -62,17 +62,19 @@ async def test_desktop_login(desktop: Guest = use(DESKTOP)):
     await desktop.keyboard.press("TAB")
     await desktop.keyboard.type(LIVE_PASSWORD)
     await desktop.keyboard.press("ENTER")
-    await desktop.screen.wait_for_image(
+    await desktop.screen.assert_screen(
         XFCE_PANEL,
         x=0,
         y=0,
         timeout=120,
+        label="desktop",
     )
 
     # Initial serial
     debian = DebianAdapter(desktop)
     await debian.terminal.assert_run("id -un", LIVE_USER, timeout=60)
     await debian.initialize(timeout=60)
+    await desktop.screen.assert_screen(XFCE_PANEL, x=0, y=0, timeout=30)
 
 
 @add_test
@@ -82,7 +84,7 @@ async def test_browser_can_open_baidu(
     BAIDU = "https://www.baidu.com"
     BAIDU_NAVIGATION = ROOT / "examples" / "assets" / "baidu-navigation.png"
 
-    before_browser = await desktop.screen.capture("before-browser")
+    before_browser = await desktop.screen.snapshot()
     await DebianAdapter(desktop).terminal.launch(
         "firefox --no-remote about:blank >/tmp/catsnail-firefox.log 2>&1 &",
         timeout=60,
@@ -93,13 +95,13 @@ async def test_browser_can_open_baidu(
     await desktop.keyboard.shortcut("CTRL", "A")
     await desktop.keyboard.type(BAIDU)
     await desktop.keyboard.press("ENTER")
-    await desktop.screen.wait_for_image(
+    await desktop.screen.assert_screen(
         BAIDU_NAVIGATION,
         x=16,
         y=126,
         timeout=60,
+        label="baidu-open",
     )
-    await desktop.screen.capture("baidu-open")
 
 
 @add_test
@@ -111,13 +113,13 @@ async def test_can_open_system_setting(
         "xfce4-settings-manager >/tmp/catsnail-settings.log 2>&1 &",
         timeout=60,
     )
-    await desktop.screen.wait_for_image(
+    await desktop.screen.assert_screen(
         XFCE_SETTINGS_WINDOW,
         x=316,
         y=121,
         timeout=60,
+        label="system-settings-open",
     )
-    await desktop.screen.capture("system-settings-open")
 
 
 @add_test
@@ -133,3 +135,4 @@ async def test_debian_serial_terminal(
     await serial.expect(r"\$ ", timeout=60)
     await serial.send("printf 'CATSNAIL_SERIAL_OK\\n'\n")
     await serial.expect(r"CATSNAIL_SERIAL_OK", timeout=30)
+    await desktop.screen.assert_screen(XFCE_PANEL, x=0, y=0, timeout=30)

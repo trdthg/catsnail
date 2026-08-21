@@ -16,6 +16,7 @@ import re
 import shlex
 import signal
 import shutil
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -356,10 +357,46 @@ class StudioSession:
                                    lambda guest: guest.screen.click(x, y),
                                    expected_revision=expected_revision)
 
+    async def right_click(
+        self, x: int, y: int, *, machine: str = "desktop",
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        return await self._control(
+            machine,
+            "right-click",
+            {"x": x, "y": y},
+            lambda guest: guest.screen.right_click(x, y),
+            expected_revision=expected_revision,
+        )
+
+    async def middle_click(
+        self, x: int, y: int, *, machine: str = "desktop",
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        return await self._control(
+            machine,
+            "middle-click",
+            {"x": x, "y": y},
+            lambda guest: guest.screen.middle_click(x, y),
+            expected_revision=expected_revision,
+        )
+
+    async def move(self, x: int, y: int, *, machine: str = "desktop",
+                   expected_revision: int | None = None) -> dict[str, Any]:
+        return await self._control(machine, "move", {"x": x, "y": y},
+                                   lambda guest: guest.screen.move(x, y),
+                                   expected_revision=expected_revision)
+
     async def type(self, text: str, *, machine: str = "desktop",
                    expected_revision: int | None = None) -> dict[str, Any]:
         return await self._control(machine, "type", {"text": text},
                                    lambda guest: guest.keyboard.type(text),
+                                   expected_revision=expected_revision)
+
+    async def paste(self, text: str, *, machine: str = "desktop",
+                    expected_revision: int | None = None) -> dict[str, Any]:
+        return await self._control(machine, "paste", {"text": text},
+                                   lambda guest: guest.keyboard.paste(text),
                                    expected_revision=expected_revision)
 
     async def key(self, key: str, *, machine: str = "desktop",
@@ -367,6 +404,16 @@ class StudioSession:
         return await self._control(machine, "key", {"key": key},
                                    lambda guest: guest.keyboard.press(key),
                                    expected_revision=expected_revision)
+
+    async def shortcut(self, *keys: str, machine: str = "desktop",
+                       expected_revision: int | None = None) -> dict[str, Any]:
+        return await self._control(
+            machine,
+            "shortcut",
+            {"keys": keys},
+            lambda guest: guest.keyboard.shortcut(*keys),
+            expected_revision=expected_revision,
+        )
 
     async def wait_stable(
         self, *, timeout: float = 30, machine: str = "desktop",
@@ -433,8 +480,11 @@ class StudioSession:
     def emit(self, name: str = "explore") -> dict[str, str]:
         output_root = self.store.target_dir / "studio" / "generated"
         output_root.mkdir(parents=True, exist_ok=True)
-        output = output_root / f"{_safe(name)}.py"
-        assets = output_root / "assets" / _safe(self.session_id)
+        draft_name = _safe(name)
+        output = output_root / f"{draft_name}.py"
+        # A session can be reset and replayed.  Event ids then begin again, so
+        # each emitted draft owns its copied assertion frames.
+        assets = output_root / "assets" / draft_name / _safe(self.session_id)
         assets.mkdir(parents=True, exist_ok=True)
         events = self._events()
         lines = [
@@ -457,12 +507,36 @@ class StudioSession:
             if action == "click":
                 lines.append(f"    await guest.screen.click({int(args.get('x', 0))}, {int(args.get('y', 0))})")
                 body += 1
+            elif action == "right-click":
+                lines.append(
+                    "    await guest.screen.right_click("
+                    f"{int(args.get('x', 0))}, {int(args.get('y', 0))})"
+                )
+                body += 1
+            elif action == "middle-click":
+                lines.append(
+                    "    await guest.screen.middle_click("
+                    f"{int(args.get('x', 0))}, {int(args.get('y', 0))})"
+                )
+                body += 1
+            elif action == "move":
+                lines.append(f"    await guest.screen.move({int(args.get('x', 0))}, {int(args.get('y', 0))})")
+                body += 1
             elif action == "type":
                 lines.append(f"    await guest.keyboard.type({str(args.get('text', '')).__repr__()})")
+                body += 1
+            elif action == "paste":
+                lines.append(f"    await guest.keyboard.paste({str(args.get('text', '')).__repr__()})")
                 body += 1
             elif action == "key":
                 lines.append(f"    await guest.keyboard.press({str(args.get('key', ''))!r})")
                 body += 1
+            elif action == "shortcut":
+                keys = args.get("keys")
+                if isinstance(keys, list) and all(isinstance(key, str) for key in keys):
+                    rendered = ", ".join(repr(key) for key in keys)
+                    lines.append(f"    await guest.keyboard.shortcut({rendered})")
+                    body += 1
             after = event.get("after")
             if isinstance(after, int):
                 matches = list(self.frames_directory.glob(f"{after:06d}-*.png"))
@@ -472,7 +546,7 @@ class StudioSession:
                     asset.write_bytes(matches[0].read_bytes())
                     lines.append(
                         "    await guest.screen.assert_screen("
-                        f"Path('assets/{_safe(self.session_id)}/{asset_name}'), "
+                        f"Path('assets/{draft_name}/{_safe(self.session_id)}/{asset_name}'), "
                         "x=0, y=0, timeout=30, label="
                         f"{str(action)!r})"
                     )
@@ -506,6 +580,11 @@ class StudioSession:
             before, _ = self._save_frame(selected.name, f"before-{action}", before_frame)
             try:
                 await operation(selected.guest)
+                # RFB delivery is synchronous, while toolkits such as SWT
+                # consume the corresponding input on a later compositor tick.
+                # Returning the pre-dispatch framebuffer makes an otherwise
+                # valid first click look like a failed action to an explorer.
+                await asyncio.sleep(0.25)
                 after_frame = await selected.guest.screen.snapshot()
             except BaseException as error:
                 event = StudioEvent(self._next_event(), selected.name, action, args,
@@ -519,7 +598,9 @@ class StudioSession:
                 time.monotonic() - started,
             ))
             self._write_replay_line(action, selected.name, args)
-            return self._frame_response(after, path, after_frame)
+            result = self._frame_response(after, path, after_frame)
+            result["changed_pixels"] = after_frame.changed_pixels(before_frame)
+            return result
 
     def _check_revision(self, expected: int | None) -> None:
         if expected is not None and expected != self._event_id:
@@ -602,10 +683,24 @@ class StudioSession:
         with self.replay_path.open("a", encoding="utf-8") as stream:
             if action == "click":
                 stream.write(f"# {machine}: click {args.get('x')} {args.get('y')}\n")
+            elif action == "right-click":
+                stream.write(
+                    f"# {machine}: right-click {args.get('x')} {args.get('y')}\n"
+                )
+            elif action == "middle-click":
+                stream.write(
+                    f"# {machine}: middle-click {args.get('x')} {args.get('y')}\n"
+                )
+            elif action == "move":
+                stream.write(f"# {machine}: move {args.get('x')} {args.get('y')}\n")
             elif action == "type":
                 stream.write(f"# {machine}: type {args.get('text')!r}\n")
+            elif action == "paste":
+                stream.write(f"# {machine}: paste {args.get('text')!r}\n")
             elif action == "key":
                 stream.write(f"# {machine}: key {args.get('key')}\n")
+            elif action == "shortcut":
+                stream.write(f"# {machine}: shortcut {'+'.join(args.get('keys', ())) }\n")
 
 
 class StudioRpcServer:
@@ -629,63 +724,156 @@ class StudioRpcServer:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             while line := await reader.readline():
-                try:
-                    request = json.loads(line)
-                    result = await self.dispatch(request)
-                    response = {"ok": True, "result": result}
-                except (Exception,) as error:
-                    response = {"ok": False, "error": str(error)}
+                request, response = await _studio_json_line(self.session, line)
                 writer.write(json.dumps(response, ensure_ascii=False).encode() + b"\n")
                 await writer.drain()
+                if _is_stop_request(request):
+                    return
         finally:
             writer.close()
             await writer.wait_closed()
 
     async def dispatch(self, request: Mapping[str, Any]) -> Any:
-        method = request.get("method")
-        params = request.get("params")
-        values = params if isinstance(params, dict) else {}
-        if method == "screen.snapshot":
-            return await self.session.snapshot(
-                machine=str(values.get("machine", "desktop")),
-                expected_revision=_optional_int(values.get("revision")),
-            )
-        if method == "screen.click":
-            return await self.session.click(
-                int(values["x"]), int(values["y"]),
-                machine=str(values.get("machine", "desktop")),
-                expected_revision=_optional_int(values.get("revision")),
-            )
-        if method == "keyboard.type":
-            return await self.session.type(
-                str(values["text"]), machine=str(values.get("machine", "desktop")),
-                expected_revision=_optional_int(values.get("revision")),
-            )
-        if method == "keyboard.press":
-            return await self.session.key(
-                str(values["key"]), machine=str(values.get("machine", "desktop")),
-                expected_revision=_optional_int(values.get("revision")),
-            )
-        if method == "screen.wait_stable":
-            return await self.session.wait_stable(
-                timeout=float(values.get("timeout", 30)),
-                machine=str(values.get("machine", "desktop")),
-                expected_revision=_optional_int(values.get("revision")),
-            )
-        if method == "serial.read":
-            return await self.session.serial(
-                machine=str(values.get("machine", "desktop")),
-                lines=int(values.get("lines", 100)),
-            )
-        if method == "screen.crop":
-            return await self.session.crop(
-                int(values["frame_id"]), int(values["x"]), int(values["y"]),
-                int(values["width"]), int(values["height"]),
-                label=str(values.get("label", "fixture")),
-            )
-        if method == "session.emit":
-            return self.session.emit(str(values.get("name", "explore")))
-        raise StudioError(f"unknown studio RPC method: {method!r}")
+        return await _dispatch_studio_request(self.session, request)
+
+
+class StudioStdioServer:
+    """JSON Lines Studio control surface for test authoring agents.
+
+    Keeping one process attached to the restored machines avoids reconnecting
+    to VNC for every exploratory action.  It intentionally shares the exact
+    request names and result payloads with :class:`StudioRpcServer`.
+    """
+
+    def __init__(self, session: StudioSession, *, ready: Mapping[str, Any]) -> None:
+        self.session = session
+        self.ready = dict(ready)
+
+    async def serve_forever(self) -> None:
+        self._write({"ok": True, "event": "ready", "result": self.ready})
+        try:
+            while True:
+                line = await asyncio.to_thread(sys.stdin.buffer.readline)
+                if not line:
+                    return
+                request, response = await _studio_json_line(self.session, line)
+                self._write(response)
+                if _is_stop_request(request):
+                    return
+        finally:
+            await self.session.stop()
+
+    @staticmethod
+    def _write(response: Mapping[str, Any]) -> None:
+        sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+async def _studio_json_line(
+    session: StudioSession, line: bytes
+) -> tuple[Mapping[str, Any], dict[str, Any]]:
+    """Decode and dispatch one JSONL request for every Studio transport."""
+
+    request: Mapping[str, Any] = {}
+    try:
+        decoded = json.loads(line)
+        if not isinstance(decoded, dict):
+            raise StudioError("studio request must be a JSON object")
+        request = decoded
+        result = await _dispatch_studio_request(session, request)
+        return request, {"ok": True, "result": result}
+    except Exception as error:
+        return request, {"ok": False, "error": str(error)}
+
+
+async def _dispatch_studio_request(
+    session: StudioSession, request: Mapping[str, Any]
+) -> Any:
+    method = request.get("method")
+    if not isinstance(method, str):
+        raise StudioError("studio request requires a string method")
+    params = request.get("params")
+    values = params if isinstance(params, dict) else {}
+    if method == "screen.snapshot":
+        return await session.snapshot(
+            machine=str(values.get("machine", "desktop")),
+            expected_revision=_optional_int(values.get("revision")),
+        )
+    if method == "screen.click":
+        return await session.click(
+            int(values["x"]), int(values["y"]),
+            machine=str(values.get("machine", "desktop")),
+            expected_revision=_optional_int(values.get("revision")),
+        )
+    if method == "screen.right_click":
+        return await session.right_click(
+            int(values["x"]), int(values["y"]),
+            machine=str(values.get("machine", "desktop")),
+            expected_revision=_optional_int(values.get("revision")),
+        )
+    if method == "screen.middle_click":
+        return await session.middle_click(
+            int(values["x"]), int(values["y"]),
+            machine=str(values.get("machine", "desktop")),
+            expected_revision=_optional_int(values.get("revision")),
+        )
+    if method == "screen.move":
+        return await session.move(
+            int(values["x"]), int(values["y"]),
+            machine=str(values.get("machine", "desktop")),
+            expected_revision=_optional_int(values.get("revision")),
+        )
+    if method == "keyboard.type":
+        return await session.type(
+            str(values["text"]), machine=str(values.get("machine", "desktop")),
+            expected_revision=_optional_int(values.get("revision")),
+        )
+    if method == "keyboard.paste":
+        return await session.paste(
+            str(values["text"]), machine=str(values.get("machine", "desktop")),
+            expected_revision=_optional_int(values.get("revision")),
+        )
+    if method == "keyboard.press":
+        return await session.key(
+            str(values["key"]), machine=str(values.get("machine", "desktop")),
+            expected_revision=_optional_int(values.get("revision")),
+        )
+    if method == "keyboard.shortcut":
+        keys = values.get("keys")
+        if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+            raise StudioError("keyboard.shortcut requires a list of keys")
+        return await session.shortcut(
+            *keys,
+            machine=str(values.get("machine", "desktop")),
+            expected_revision=_optional_int(values.get("revision")),
+        )
+    if method == "screen.wait_stable":
+        return await session.wait_stable(
+            timeout=float(values.get("timeout", 30)),
+            machine=str(values.get("machine", "desktop")),
+            expected_revision=_optional_int(values.get("revision")),
+        )
+    if method == "serial.read":
+        return await session.serial(
+            machine=str(values.get("machine", "desktop")),
+            lines=int(values.get("lines", 100)),
+        )
+    if method == "screen.crop":
+        return await session.crop(
+            int(values["frame_id"]), int(values["x"]), int(values["y"]),
+            int(values["width"]), int(values["height"]),
+            label=str(values.get("label", "fixture")),
+        )
+    if method == "session.emit":
+        return session.emit(str(values.get("name", "explore")))
+    if method == "session.stop":
+        await session.stop()
+        return {"session": session.session_id, "status": "stopped"}
+    raise StudioError(f"unknown studio request method: {method!r}")
+
+
+def _is_stop_request(request: Mapping[str, Any]) -> bool:
+    return request.get("method") == "session.stop"
 
 
 def _machine_name(node: TestNode[Any], source: Any, index: int) -> str:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from .recording import StepRecorder
 from ..qemu.vnc import Frame, VncClient
@@ -17,6 +17,10 @@ if TYPE_CHECKING:
 
 class GuestControlError(RuntimeError):
     """Raised when a guest GUI or its local control endpoint is unavailable."""
+
+
+class ScreenAssertionError(GuestControlError):
+    """Raised when a requested visual state is not present on screen."""
 
 
 class Keyboard:
@@ -31,6 +35,10 @@ class Keyboard:
     async def type(self, value: str) -> None:
         await self._vnc.type_text(value)
         await self._after_step("keyboard-type")
+
+    async def paste(self, value: str) -> None:
+        await self._vnc.paste_text(value)
+        await self._after_step("keyboard-paste")
 
     async def press(self, key: str) -> None:
         await self._vnc.press(_keysym(key))
@@ -93,34 +101,53 @@ class Screen:
         await self._vnc.click(x, y, button=2)
         await self.record_step("screen-middle-click")
 
+    async def right_click(self, x: int, y: int) -> None:
+        """Open the context menu at a screen coordinate."""
+
+        await self._vnc.click(x, y, button=3)
+        await self.record_step("screen-right-click")
+
     async def move(self, x: int, y: int) -> None:
         """Move the pointer over a guest UI control without clicking it."""
 
         await self._vnc.move(x, y)
         await self.record_step("screen-move")
 
-    async def minimize_active_window(self) -> None:
-        """Minimize the focused GNOME window without depending on its position."""
+    async def scroll(self, x: int, y: int, amount: int) -> None:
+        """Scroll a guest control at ``(x, y)``; positive values scroll up."""
 
-        frame = await self._vnc.frame()
-        x, y = _minimize_button(frame)
-        await self.click(x, y)
+        await self._vnc.scroll(x, y, amount)
+        await self.record_step("screen-scroll")
 
     async def record_step(self, label: str) -> None:
         if self._recorder is None:
             return
         self._record(await self._vnc.frame(), label)
 
-    async def wait_for_change(self, baseline: Frame, *, timeout: float) -> Frame:
-        """Wait for a materially different frame, retaining diagnostics on timeout."""
+    async def wait_for_change(
+        self,
+        baseline: Frame,
+        *,
+        timeout: float,
+        minimum_changed_pixels: int | None = None,
+    ) -> Frame:
+        """Wait for a material framebuffer change, retaining diagnostics on timeout.
+
+        The default ignores incidental full-screen repaint noise. Pass a small
+        explicit threshold for a local control such as an SWT list selection.
+        """
 
         deadline = asyncio.get_running_loop().time() + timeout
+        threshold = (
+            (baseline.width * baseline.height) // 20
+            if minimum_changed_pixels is None
+            else minimum_changed_pixels
+        )
+        if threshold < 0:
+            raise ValueError("minimum_changed_pixels must not be negative")
         while True:
             current = await self._vnc.frame(timeout=min(10, max(1, timeout)))
-            if (
-                current.changed_pixels(baseline)
-                > (current.width * current.height) // 20
-            ):
+            if current.changed_pixels(baseline) > threshold:
                 self._record(current, "screen-change")
                 return current
             if asyncio.get_running_loop().time() >= deadline:
@@ -130,12 +157,32 @@ class Screen:
                 )
             await asyncio.sleep(0.5)
 
+    async def wait_for_stable(self, *, timeout: float = 30) -> Frame:
+        """Wait until the framebuffer is unchanged across two polls."""
+
+        deadline = asyncio.get_running_loop().time() + timeout
+        previous: Frame | None = None
+        stable = 0
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise GuestControlError("timed out waiting for a stable screen")
+            current = await self._vnc.frame(timeout=min(10, max(1, remaining)))
+            if previous is not None and current.changed_pixels(previous) == 0:
+                stable += 1
+                if stable >= 2:
+                    return current
+            else:
+                stable = 0
+            previous = current
+            await asyncio.sleep(0.25)
+
     async def assert_screen(
         self,
         template_path: Path,
         *,
-        x: int,
-        y: int,
+        x: int | None,
+        y: int | None,
         maximum_mean_difference: float = 12.0,
         timeout: float,
         label: str | None = None,
@@ -148,19 +195,23 @@ class Screen:
         """
 
         template = Frame.read_png(template_path)
+        if x is None and y is None:
+            raise ValueError("assert_screen needs an x or y anchor")
         deadline = asyncio.get_running_loop().time() + timeout
         latest: Frame | None = None
         difference = float("inf")
         while True:
             latest = await self._vnc.frame(timeout=min(10, max(1, timeout)))
-            difference = _image_difference(latest, template, x=x, y=y)
+            matched_x = x if x is not None else _locate_template_x(latest, template, y=y)
+            matched_y = y if y is not None else _locate_template_y(latest, template, x=x)
+            difference = _image_difference(latest, template, x=matched_x, y=matched_y)
             if difference <= maximum_mean_difference:
                 self._publish(latest, label or template_path.stem)
                 return latest
             if asyncio.get_running_loop().time() >= deadline:
                 path = self._save(latest, "screen-assertion-failed")
-                raise GuestControlError(
-                    f"screen assertion failed for {template_path} at ({x}, {y}); "
+                raise ScreenAssertionError(
+                    f"screen assertion failed for {template_path} at ({matched_x}, {matched_y}); "
                     f"mean difference {difference:.1f}; frame {latest.width}x{latest.height}; "
                     f"template {template.width}x{template.height}; screenshot: {path}"
                 )
@@ -199,31 +250,80 @@ def _image_difference(frame: Frame, template: Frame, *, x: int, y: int) -> float
     return frame.mean_absolute_difference(template, x=x, y=y)
 
 
-def _minimize_button(frame: Frame) -> tuple[int, int]:
-    """Locate the minimize control in a GNOME dark window title bar."""
+def _locate_template_x(frame: Frame, template: Frame, *, y: int | None) -> int:
+    """Find a template's most likely horizontal origin before full matching."""
 
-    candidate: tuple[int, int, int] | None = None
-    for y in range(32, min(frame.height - 1, 250)):
-        positions = [x for x in range(frame.width) if _is_dark_neutral(frame, x, y)]
-        if len(positions) < 300:
-            continue
-        left, right = min(positions), max(positions)
-        width = right - left + 1
-        if width < 500:
-            continue
-        score = (width, y, right)
-        if candidate is None or score[0] > candidate[0]:
-            candidate = score
-    if candidate is None:
-        raise GuestControlError("could not locate the active window title bar")
-    _, y, right = candidate
-    return right - 104, y
+    if y is None or y < 0 or y + template.height > frame.height:
+        return 0
+    limit = frame.width - template.width
+    if limit < 0:
+        return 0
+    anchors = _template_anchors(template)
+    best_x, best_difference = 0, float("inf")
+    for x in range(limit + 1):
+        difference = 0
+        for anchor_x, anchor_y, red, green, blue in anchors:
+            offset = ((y + anchor_y) * frame.width + x + anchor_x) * 4
+            actual_red, actual_green, actual_blue = frame.rgba[offset : offset + 3]
+            difference += (
+                abs(actual_red - red)
+                + abs(actual_green - green)
+                + abs(actual_blue - blue)
+            )
+        if difference < best_difference:
+            best_x, best_difference = x, difference
+    return best_x
 
 
-def _is_dark_neutral(frame: Frame, x: int, y: int) -> bool:
-    offset = (y * frame.width + x) * 4
-    red, green, blue = frame.rgba[offset : offset + 3]
-    return 15 <= red <= 60 and abs(red - green) <= 6 and abs(red - blue) <= 6
+def _locate_template_y(frame: Frame, template: Frame, *, x: int | None) -> int:
+    """Find a template's most likely vertical origin before full matching."""
+
+    if x is None or x < 0 or x + template.width > frame.width:
+        return 0
+    limit = frame.height - template.height
+    if limit < 0:
+        return 0
+    anchors = _template_anchors(template)
+    best_y, best_difference = 0, float("inf")
+    for y in range(limit + 1):
+        difference = 0
+        for anchor_x, anchor_y, red, green, blue in anchors:
+            offset = ((y + anchor_y) * frame.width + x + anchor_x) * 4
+            actual_red, actual_green, actual_blue = frame.rgba[offset : offset + 3]
+            difference += (
+                abs(actual_red - red)
+                + abs(actual_green - green)
+                + abs(actual_blue - blue)
+            )
+        if difference < best_difference:
+            best_y, best_difference = y, difference
+    return best_y
+
+
+def _template_anchors(template: Frame) -> tuple[tuple[int, int, int, int, int], ...]:
+    """Pick dark visual details from a grid as inexpensive location anchors."""
+
+    columns, rows = 8, 10
+    anchors: list[tuple[int, int, int, int, int]] = []
+    for row in range(rows):
+        top = row * template.height // rows
+        bottom = max(top + 1, (row + 1) * template.height // rows)
+        for column in range(columns):
+            left = column * template.width // columns
+            right = max(left + 1, (column + 1) * template.width // columns)
+            candidate: tuple[int, int, int, int, int] | None = None
+            candidate_darkness = -1
+            for anchor_y in range(top, bottom):
+                for anchor_x in range(left, right):
+                    offset = (anchor_y * template.width + anchor_x) * 4
+                    red, green, blue = template.rgba[offset : offset + 3]
+                    darkness = 765 - red - green - blue
+                    if darkness > candidate_darkness:
+                        candidate = (anchor_x, anchor_y, red, green, blue)
+                        candidate_darkness = darkness
+            assert candidate is not None
+            anchors.append(candidate)
+    return tuple(anchors)
 
 
 @dataclass(frozen=True)
@@ -235,11 +335,27 @@ class NetworkInterface:
     mac: str
 
 
+@dataclass(frozen=True)
+class NetworkLink:
+    """An emulated NIC that Catsnail can connect or disconnect through QMP."""
+
+    network: Network
+    device_id: str
+
+
 class GuestNetwork:
     """Private NIC metadata reported by the active QEMU backend."""
 
-    def __init__(self, interfaces: tuple[NetworkInterface, ...]) -> None:
+    def __init__(
+        self,
+        interfaces: tuple[NetworkInterface, ...],
+        *,
+        links: tuple[NetworkLink, ...] = (),
+        qmp_socket: Path | None = None,
+    ) -> None:
         self._interfaces = {interface.network: interface for interface in interfaces}
+        self._links = {link.network: link for link in links}
+        self._qmp_socket = qmp_socket
 
     @property
     def interfaces(self) -> tuple[NetworkInterface, ...]:
@@ -253,6 +369,27 @@ class GuestNetwork:
             )
         return interface
 
+    async def disconnect(self, network: Network) -> None:
+        """Disconnect a declared QEMU NIC without altering the host network."""
+
+        link = self._links.get(network)
+        if link is None:
+            raise GuestControlError("guest is not attached to the declared network")
+        if self._qmp_socket is None:
+            raise GuestControlError("guest QMP control is unavailable")
+        from ..qemu.qmp import QmpClient, QmpError
+
+        try:
+            qmp = await QmpClient.connect(self._qmp_socket)
+            try:
+                await qmp.execute("set_link", {"name": link.device_id, "up": False})
+            finally:
+                await qmp.close()
+        except (OSError, ConnectionError, QmpError) as error:
+            raise GuestControlError(
+                f"could not disconnect guest network {link.device_id}: {error}"
+            ) from error
+
 
 class Guest:
     """The runtime handle supplied to an executed ``@add_test`` function."""
@@ -265,12 +402,17 @@ class Guest:
         vnc: VncClient,
         control_port: int,
         interfaces: tuple[NetworkInterface, ...] = (),
+        links: tuple[NetworkLink, ...] = (),
         record: bool = False,
     ) -> None:
         self.source_id = source_id
         self._running = running
         self._vnc = vnc
         self._close_callbacks: list[Callable[[], Awaitable[None]]] = []
+        # Concrete adapters may be reconstructed by independent test helpers.
+        # Keep physical guest-session state here so those wrappers do not open
+        # competing terminals or duplicate guest-side services.
+        self._adapter_state: dict[str, Any] = {}
         self._release_directory = running.artifacts.release_directory
         self._recorder = (
             StepRecorder(running.artifacts.debug_directory) if record else None
@@ -283,7 +425,11 @@ class Guest:
         )
         self.keyboard = Keyboard(vnc, self.screen.record_step)
         self._control_url = f"http://127.0.0.1:{control_port}"
-        self.network = GuestNetwork(interfaces)
+        self.network = GuestNetwork(
+            interfaces,
+            links=links,
+            qmp_socket=running.artifacts.qmp_socket,
+        )
 
     def _register_close_callback(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._close_callbacks.append(callback)
@@ -291,6 +437,12 @@ class Guest:
     @property
     def artifacts(self) -> Path:
         return self._running.artifacts.directory
+
+    @property
+    def vnc_socket(self) -> Path:
+        """Return the local VNC endpoint for read-only observers."""
+
+        return self._running.artifacts.vnc_socket
 
     @property
     def debug_directory(self) -> Path:
@@ -336,6 +488,11 @@ def _keysym(name: str) -> int:
         "DOWN": 0xFF54,
         "LEFT": 0xFF51,
         "RIGHT": 0xFF53,
+        "MENU": 0xFF67,
+        "HOME": 0xFF50,
+        "END": 0xFF57,
+        "PAGEUP": 0xFF55,
+        "PAGEDOWN": 0xFF56,
     }
     upper = name.upper()
     if upper in keys:

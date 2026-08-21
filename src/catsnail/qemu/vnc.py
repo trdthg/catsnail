@@ -60,6 +60,11 @@ class Frame:
     def write_png(self, path: Path) -> None:
         """Write an 8-bit RGB PNG without requiring a third-party image library."""
 
+        path.write_bytes(self.to_png())
+
+    def to_png(self) -> bytes:
+        """Encode the framebuffer as an 8-bit RGB PNG in memory."""
+
         rows = bytearray()
         for row in range(self.height):
             rows.append(0)  # PNG filter type: None.
@@ -67,7 +72,7 @@ class Frame:
             for pixel in range(start, start + self.width * 4, 4):
                 rows.extend(self.rgba[pixel : pixel + 3])
         header = struct.pack(">IIBBBBB", self.width, self.height, 8, 2, 0, 0, 0)
-        path.write_bytes(
+        return (
             b"\x89PNG\r\n\x1a\n"
             + _png_chunk(b"IHDR", header)
             + _png_chunk(b"IDAT", zlib.compress(rows, level=6))
@@ -280,11 +285,18 @@ class VncClient:
         mask = button_masks.get(button)
         if mask is None:
             raise ValueError(f"unsupported VNC mouse button: {button}")
+        # Some guest desktops do not dispatch a button event reliably when
+        # the first event also changes the absolute pointer position. Send a
+        # separate motion event and let the compositor consume it first.
+        await self.move(x, y)
+        await asyncio.sleep(0.05)
         self.writer.write(struct.pack(">BBHH", 5, mask, x, y))
         await self.writer.drain()
-        # Flutter/Wayland clients can drop a press-release pair delivered in
-        # the same VNC write. Hold the button across one compositor tick.
-        await asyncio.sleep(0.05)
+        # SWT/XWayland and Flutter/Wayland clients can drop a press-release
+        # pair delivered in the same VNC write. Keep the button down across
+        # several compositor ticks so a focused button also receives its
+        # activation event.
+        await asyncio.sleep(0.15)
         self.writer.write(struct.pack(">BBHH", 5, 0, x, y))
         await self.writer.drain()
 
@@ -295,6 +307,27 @@ class VncClient:
             raise VncError(f"pointer coordinates outside framebuffer: ({x}, {y})")
         self.writer.write(struct.pack(">BBHH", 5, 0, x, y))
         await self.writer.drain()
+
+    async def scroll(self, x: int, y: int, amount: int) -> None:
+        """Scroll at ``(x, y)`` using standard RFB wheel button events.
+
+        Positive values scroll up and negative values scroll down.  RFB
+        represents each wheel notch as a temporary pointer button rather than
+        a delta, so send one event per requested notch.
+        """
+
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            raise VncError(f"pointer coordinates outside framebuffer: ({x}, {y})")
+        if amount == 0:
+            return
+        mask = 8 if amount > 0 else 16
+        await self.move(x, y)
+        for _ in range(abs(amount)):
+            self.writer.write(struct.pack(">BBHH", 5, mask, x, y))
+            await self.writer.drain()
+            # Leave the widget one compositor turn per wheel notch.  In
+            # particular, SWT tables coalesce wheel events received together.
+            await asyncio.sleep(0.02)
 
     async def type_text(self, value: str) -> None:
         for character in value:
@@ -316,6 +349,21 @@ class VncClient:
             # Enter immediately can replace the last character of a long
             # command. Leave the guest one input tick before the next action.
             await asyncio.sleep(0.1)
+
+    async def paste_text(self, value: str) -> None:
+        """Offer text through RFB's clipboard channel for a normal Ctrl+V."""
+
+        payload = value.encode("utf-8")
+        if len(payload) > 1 << 20:
+            raise VncError("VNC clipboard text exceeds the 1 MiB limit")
+        self.writer.write(struct.pack(">BxxxI", 6, len(payload)) + payload)
+        await self.writer.drain()
+        await self.key(0xFFE3, True)
+        try:
+            await self.press(ord("v"))
+        finally:
+            await self.key(0xFFE3, False)
+        await asyncio.sleep(0.1)
 
     async def _handshake(self) -> None:
         version = await self.reader.readexactly(12)
@@ -482,6 +530,7 @@ def _qnum_for_keysym(keysym: int) -> int | None:
         0xFF52: 0xC8,  # Up
         0xFF53: 0xCD,  # Right
         0xFF54: 0xD0,  # Down
+        0xFF67: 0xDD,  # Menu
     }
     if 0xFFBE <= keysym <= 0xFFC9:
         return 0x3B + keysym - 0xFFBE

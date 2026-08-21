@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 import asyncio
+import json
 import os
 import re
 import shutil
+import sys
 from typing import cast
 
 import pytest
@@ -15,7 +17,7 @@ from catsnail.qemu.artifacts import RunArtifacts
 from catsnail.qemu.network import SocketAttachment, UserAttachment
 from catsnail.qemu.qmp import QmpClient
 from catsnail.qemu.runner import (
-    QemuNetwork,
+    QemuLaunchOptions,
     QemuProcess,
     QemuRunError,
     QemuRunner,
@@ -44,7 +46,53 @@ def test_build_command_uses_qmp_and_serial_artifacts(tmp_path: Path) -> None:
 
     assert "-qmp" in command
     assert f"file:{artifacts.serial_log}" in command
-    assert "accel=kvm:tcg" in command
+    assert "accel=kvm" in command
+
+
+def test_build_command_supports_explicit_tcg_benchmark_options(tmp_path: Path) -> None:
+    artifacts = RunArtifacts.create(tmp_path / "target")
+    runner = QemuRunner(
+        options=QemuLaunchOptions(
+            executable="/opt/qemu/bin/qemu-system-x86_64",
+            acceleration="tcg",
+            tcg_thread="multi",
+            tcg_tb_size=1024,
+        )
+    )
+
+    command = runner.build_command(Machine(), artifacts)
+
+    assert command[0] == "/opt/qemu/bin/qemu-system-x86_64"
+    assert command[command.index("-machine") + 1] == "pc"
+    assert command[command.index("-accel") + 1] == "tcg,thread=multi,tb-size=1024"
+    assert "accel=kvm" not in command
+
+
+def test_build_command_can_allocate_guest_memory_from_hugetlbfs(
+    tmp_path: Path,
+) -> None:
+    artifacts = RunArtifacts.create(tmp_path / "target")
+    runner = QemuRunner(
+        options=QemuLaunchOptions(hugepage_path=Path("/dev/hugepages"))
+    )
+
+    command = runner.build_command(Machine(memory="256M"), artifacts)
+
+    assert command[command.index("-mem-path") + 1] == "/dev/hugepages"
+    assert "-mem-prealloc" in command
+
+
+def test_build_command_adds_an_absolute_tablet_for_vnc(
+    tmp_path: Path,
+) -> None:
+    artifacts = RunArtifacts.create(tmp_path / "target")
+    command = QemuRunner().build_command(Machine(), artifacts, vnc=True)
+
+    controller_index = command.index("piix3-usb-uhci,id=catsnail-usb")
+    assert command[controller_index - 1] == "-device"
+    tablet_index = command.index("usb-tablet,bus=catsnail-usb.0")
+    assert command[tablet_index - 1] == "-device"
+    assert f"unix:{artifacts.vnc_socket}" in command
 
 
 def test_start_resolves_a_url_iso_before_building_qemu_command(
@@ -54,9 +102,7 @@ def test_start_resolves_a_url_iso_before_building_qemu_command(
     cached = tmp_path / "cache" / "image.iso"
     cached.parent.mkdir()
     cached.write_bytes(b"image")
-    machine = Machine(
-        iso="https://images.example.test/debian.iso", sha256="1" * 64
-    )
+    machine = Machine(iso="https://images.example.test/debian.iso", sha256="1" * 64)
     resolved: list[Machine] = []
 
     async def resolve(iso: Path | str | None, sha256: str | None) -> Path:
@@ -90,9 +136,7 @@ def test_start_reports_an_unpinned_remote_iso_with_a_reproduction_script(
     digest = "a" * 64
 
     async def resolve(_: Path | str | None, __: str | None) -> Path:
-        raise ImageError(
-            f"remote ISO requires sha256; calculated sha256: {digest}"
-        )
+        raise ImageError(f"remote ISO requires sha256; calculated sha256: {digest}")
 
     monkeypatch.setattr("catsnail.qemu.runner.resolve_iso", resolve)
     runner = QemuRunner(executable="/bin/true")
@@ -140,6 +184,49 @@ def test_prepare_discards_artifacts_from_the_previous_cli_run(tmp_path: Path) ->
     assert current.release_directory.is_dir()
 
 
+def test_prepare_preserves_an_active_studio_session(tmp_path: Path) -> None:
+    target_dir = tmp_path / "target"
+    artifacts = RunArtifacts.create(
+        target_dir, relative_directory=Path("studio") / "active" / "desktop"
+    )
+    for socket in (
+        artifacts.serial_socket,
+        artifacts.qmp_socket,
+        artifacts.vnc_socket,
+    ):
+        socket.touch()
+    manifest = target_dir / "run" / "studio" / "active" / "session.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "status": "active",
+                "machines": {
+                    "desktop": {
+                        "pid": os.getpid(),
+                        "serial_socket": str(artifacts.serial_socket),
+                        "qmp_socket": str(artifacts.qmp_socket),
+                        "vnc_socket": str(artifacts.vnc_socket),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale = RunArtifacts.create(target_dir, relative_directory=Path("stale"))
+
+    assert manifest.is_file()
+
+    RunArtifacts.prepare(target_dir)
+
+    assert manifest.is_file()
+    assert artifacts.directory.is_dir()
+    assert all(
+        socket.exists()
+        for socket in (artifacts.serial_socket, artifacts.qmp_socket, artifacts.vnc_socket)
+    )
+    assert not stale.directory.exists()
+
+
 def test_artifact_directory_rejects_paths_outside_the_current_run(
     tmp_path: Path,
 ) -> None:
@@ -160,9 +247,7 @@ def test_build_command_adds_an_isolated_socket_nic(tmp_path: Path) -> None:
     command = QemuRunner().build_command(
         Machine(),
         artifacts,
-        network_attachments=(
-            SocketAttachment("listen", 24567, "52:54:00:12:34:56"),
-        ),
+        network_attachments=(SocketAttachment("listen", 24567, "52:54:00:12:34:56"),),
     )
 
     assert "socket,id=socket0,listen=127.0.0.1:24567" in command
@@ -193,15 +278,12 @@ def test_build_command_forwards_control_over_the_first_user_nic(
     command = QemuRunner().build_command(
         Machine(),
         artifacts,
-        network=QemuNetwork(control_port=48123),
-        network_attachments=(
-            UserAttachment("10.66.12.0/24", "52:54:00:12:34:56"),
-        ),
+        guest_control_port=48123,
+        network_attachments=(UserAttachment("10.66.12.0/24", "52:54:00:12:34:56"),),
     )
 
     assert (
-        "user,id=user0,net=10.66.12.0/24,hostfwd=tcp:127.0.0.1:48123-:8123"
-        in command
+        "user,id=user0,net=10.66.12.0/24,hostfwd=tcp:127.0.0.1:48123-:8123" in command
     )
     assert "e1000,netdev=control,mac=52:54:00:52:00:01" not in command
 
@@ -266,6 +348,47 @@ def test_stop_cleans_qmp_socket_after_qemu_already_exited(tmp_path: Path) -> Non
     returncode = asyncio.run(exercise())
     assert returncode != 0
     assert not artifacts.qmp_socket.exists()
+
+
+def test_stop_all_instances_reaps_only_tracked_qemu_processes(tmp_path: Path) -> None:
+    artifacts = RunArtifacts.create(tmp_path / "target")
+    runner = QemuRunner(executable=sys.executable)
+
+    def command(*_: object, **__: object) -> list[str]:
+        return [sys.executable, "-c", "import time; time.sleep(60)"]
+
+    runner.build_command = command  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        running = await runner.start(Machine(), artifacts)
+        assert running.process.returncode is None
+        await QemuRunner.stop_all_instances()
+        assert await running.process.wait() < 0
+
+    asyncio.run(exercise())
+    assert not artifacts.qmp_socket.exists()
+
+
+def test_cancelling_stop_still_reaps_the_process_group(tmp_path: Path) -> None:
+    artifacts = RunArtifacts.create(tmp_path / "target")
+    runner = QemuRunner(executable=sys.executable)
+
+    def command(*_: object, **__: object) -> list[str]:
+        return [sys.executable, "-c", "import time; time.sleep(60)"]
+
+    runner.build_command = command  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        running = await runner.start(Machine(), artifacts)
+        stopping = asyncio.create_task(runner.stop(running))
+        await asyncio.sleep(0)
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        assert await running.process.wait() < 0
+        assert not runner._active
+
+    asyncio.run(exercise())
 
 
 def test_reproduction_command_quotes_paths(tmp_path: Path) -> None:

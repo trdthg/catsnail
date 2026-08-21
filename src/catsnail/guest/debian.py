@@ -70,8 +70,35 @@ class DebianTerminal:
         self._keyboard = guest.keyboard
         self._control_url = guest._control_url
         self._after_step = guest.screen.record_step
-        self._server_started = False
-        self._password_required: bool | None = None
+        state = guest._adapter_state.get("debian-terminal")
+        if state is None:
+            state = _DebianTerminalState()
+            guest._adapter_state["debian-terminal"] = state
+        self._state: _DebianTerminalState = state
+
+    @property
+    def _server_started(self) -> bool:
+        return self._state.server_started
+
+    @_server_started.setter
+    def _server_started(self, value: bool) -> None:
+        self._state.server_started = value
+
+    @property
+    def _focused(self) -> bool:
+        return self._state.focused
+
+    @_focused.setter
+    def _focused(self, value: bool) -> None:
+        self._state.focused = value
+
+    @property
+    def _password_required(self) -> bool | None:
+        return self._state.password_required
+
+    @_password_required.setter
+    def _password_required(self, value: bool | None) -> None:
+        self._state.password_required = value
 
     async def run(
         self, command: str, *, admin: bool = False, timeout: float = 120.0
@@ -88,6 +115,9 @@ class DebianTerminal:
         await self._keyboard.type(command)
         await self._keyboard.press("ENTER")
         await self._after_step("terminal-launched")
+        # A desktop application launched in the background normally receives
+        # focus immediately. Re-open a terminal before a later guest command.
+        self._focused = False
 
     async def command(
         self,
@@ -171,12 +201,19 @@ class DebianTerminal:
         await result.wait_for_output(expected, deadline=deadline)
         await result.wait(timeout=max(0.0, deadline - time.monotonic()))
 
-    async def focus(self) -> None:
-        """Open a new terminal window and give it keyboard focus."""
+    async def focus(self, *, timeout: float = 10.0) -> None:
+        """Open a terminal and verify that it owns keyboard focus."""
 
-        await self._keyboard.shortcut("CTRL", "ALT", "T")
-        await asyncio.sleep(1)
+        if self._focused:
+            return
+        await self._open_terminal_window()
+        self._focused = True
         await self._after_step("terminal-focus")
+
+    def _mark_unfocused(self) -> None:
+        """Record that an OS window action moved focus away from the shell."""
+
+        self._focused = False
 
     async def _password_command(
         self, command: str, *, timeout: float, capture_output: bool
@@ -232,56 +269,124 @@ class DebianTerminal:
             # the caller's expression so ``a && b`` captures both commands.
             rendered = f"({command}) > /tmp/{token}.out 2>&1"
             output_url = f"{self._control_url}/{token}.out"
-        await self._keyboard.type(f"{rendered}; printf %s $? > /tmp/{token}")
-        await self._keyboard.press("ENTER")
-        return TerminalCommand(
-            command=command,
-            result_url=f"{self._control_url}/{token}",
-            output_url=output_url,
-            after_step=self._after_step,
+        # RFB acknowledges typing before GNOME has necessarily delivered it
+        # to the shell. The marker is written before the caller's command;
+        # when it is absent, the exact same idempotent envelope can be sent
+        # again after opening a fresh terminal without running the command
+        # twice if the first input arrives late.
+        # Keep this envelope free of braces. On the Ubuntu Xwayland desktop,
+        # a long VNC command can occasionally lose a shifted bracket, which
+        # turns an otherwise successful native X11 action into a Bash syntax
+        # error. The plain shell keywords are equally idempotent and survive
+        # the same input path reliably.
+        entered = (
+            f"if test -e /tmp/{token}.started; then :; else "
+            f"printf 1 > /tmp/{token}.started; "
+            f"{rendered}; printf %s $? > /tmp/{token}; fi"
         )
+        started_url = f"{self._control_url}/{token}.started"
+        deadline = time.monotonic() + timeout
+        for attempt in range(2):
+            await self._keyboard.type(entered)
+            await self._keyboard.press("ENTER")
+            remaining = deadline - time.monotonic()
+            if remaining > 0 and await self._command_started(
+                started_url, timeout=min(5.0, remaining)
+            ):
+                return TerminalCommand(
+                    command=command,
+                    result_url=f"{self._control_url}/{token}",
+                    output_url=output_url,
+                    after_step=self._after_step,
+                )
+            if attempt == 0:
+                # The command was sent to some other window. Do not trust the
+                # cached focus flag after that observation.
+                self._focused = False
+                await self.focus(timeout=max(0.0, deadline - time.monotonic()))
+        raise GuestControlError(
+            f"terminal did not accept command input within {timeout:.1f}s: {command}"
+        )
+
+    async def _command_started(self, url: str, *, timeout: float) -> bool:
+        try:
+            # A 404 means the shell has not written its marker yet, not that
+            # input failed. Let ``_read_text`` poll until the short delivery
+            # window expires. Returning immediately on 404 caused a native
+            # X11 action to be typed a second time after it had minimized its
+            # own helper terminal, leaving the retry in the wrong window.
+            return bool(await _read_text(url, timeout))
+        except GuestControlError:
+            return False
 
     async def _ensure_server(self, *, timeout: float) -> None:
         if self._server_started:
+            if not self._focused:
+                await self.focus(timeout=timeout)
             return
-        try:
-            # A restored checkpoint can already contain the guest-side server.
-            await _read_text(
-                f"{self._control_url}/does-not-exist",
-                min(timeout, 1),
-                allow_not_found=True,
-            )
-        except GuestControlError:
-            pass
-        else:
+        # A restored checkpoint can already contain the guest-side server.
+        # Do not assume Ctrl+Alt+T has completed just because VNC accepted the
+        # shortcut: a command sent too early is otherwise typed into Eclipse.
+        if await self._server_available(timeout=min(timeout, 1.0)):
             # The HTTP server survives snapshot restoration, but the terminal
             # window that started it is normally behind the restored GUI. A
             # fresh terminal owns keyboard focus for the next command without
             # disturbing the reusable server process.
-            await self.focus()
+            await self.focus(timeout=timeout)
             self._server_started = True
             return
         probe_timeout = min(timeout, 5.0)
         if await self._open_terminal_with_shortcut(timeout=probe_timeout):
             self._server_started = True
+            self._focused = True
             return
         if await self._open_terminal_with_search(timeout=probe_timeout):
             self._server_started = True
+            self._focused = True
             return
         raise GuestControlError("could not open a terminal in the guest desktop")
 
     async def _open_terminal_with_shortcut(self, *, timeout: float) -> bool:
-        await self._keyboard.shortcut("CTRL", "ALT", "T")
-        await asyncio.sleep(1)
+        await self._open_terminal_window()
         return await self._bootstrap_server(timeout=timeout)
 
     async def _open_terminal_with_search(self, *, timeout: float) -> bool:
+        await self._open_terminal_from_search()
+        return await self._bootstrap_server(timeout=timeout)
+
+    async def _open_terminal_from_search(self) -> None:
+        # Start from a known shell-search state. A failed shortcut can leave
+        # the desktop overview open, and its previous query must not be mixed
+        # with "terminal".
+        await self._keyboard.press("ESC")
+        await asyncio.sleep(0.5)
         await self._keyboard.press("SUPER")
         await asyncio.sleep(1)
         await self._keyboard.type("terminal")
+        # GNOME's application index is populated asynchronously after
+        # snapshot restoration. Waiting before Enter is essential: otherwise
+        # Enter clears a still-empty search rather than launching Terminal.
+        await asyncio.sleep(2)
         await self._keyboard.press("ENTER")
         await asyncio.sleep(2)
-        return await self._bootstrap_server(timeout=timeout)
+
+    async def _open_terminal_window(self) -> None:
+        await self._keyboard.shortcut("CTRL", "ALT", "T")
+        # GNOME must create and map the window before further key events are
+        # accepted by its child shell. Snapshot restoration makes this slower
+        # than a fresh desktop in practice.
+        await asyncio.sleep(2)
+
+    async def _server_available(self, *, timeout: float) -> bool:
+        try:
+            await _read_text(
+                f"{self._control_url}/does-not-exist",
+                timeout,
+                allow_not_found=True,
+            )
+        except GuestControlError:
+            return False
+        return True
 
     async def _bootstrap_server(self, *, timeout: float) -> bool:
         await self._keyboard.type(
@@ -297,6 +402,15 @@ class DebianTerminal:
         except GuestControlError:
             return False
         return True
+
+
+class _DebianTerminalState:
+    """Guest-lifetime state shared by short-lived Debian adapter wrappers."""
+
+    def __init__(self) -> None:
+        self.server_started = False
+        self.focused = False
+        self.password_required: bool | None = None
 
 
 class DebianSerial:

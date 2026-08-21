@@ -24,7 +24,7 @@ from catsnail.graph.executor import (
     _safe_component,
 )
 from catsnail.qemu.artifacts import RunArtifacts
-from catsnail.qemu.runner import QemuProcess, QemuRunError
+from catsnail.qemu.runner import QemuLaunchOptions, QemuProcess, QemuRunError
 from catsnail.qemu.session import SourceRuntime
 from catsnail.qemu.vnc import VncClient
 
@@ -32,6 +32,17 @@ from catsnail.qemu.vnc import VncClient
 class _ClosedVnc:
     async def close(self) -> None:
         return None
+
+
+async def _checkpoint_helper_first() -> None:
+    return None
+
+
+async def _checkpoint_helper_second() -> None:
+    await asyncio.sleep(0)
+
+
+_checkpoint_helper = _checkpoint_helper_first
 
 
 class _CheckpointExecutor(GraphExecutor):
@@ -50,6 +61,7 @@ class _CheckpointExecutor(GraphExecutor):
             directory=directory,
             debug_directory=directory / "debug",
             release_directory=directory / "release",
+            qmp_socket=directory / "qmp.sock",
         )
         artifacts.debug_directory.mkdir(exist_ok=True)
         artifacts.release_directory.mkdir(exist_ok=True)
@@ -284,6 +296,44 @@ def test_checkpoint_keys_invalidate_a_and_b_without_invalidating_boot() -> None:
     assert checkpoint_key(changed_b) != before_b
 
 
+def test_checkpoint_key_separates_non_default_qemu_launch_options() -> None:
+    source = add_os(Machine())
+
+    @add_test
+    async def boot(guest: Guest = use(source)) -> None:
+        del guest
+
+    default = checkpoint_key(boot)
+    tcg = checkpoint_key(
+        boot,
+        runtime=QemuLaunchOptions(
+            acceleration="tcg", tcg_thread="multi", tcg_tb_size=1024
+        ).checkpoint_identity(),
+    )
+
+    assert tcg != default
+
+
+def test_checkpoint_key_includes_same_module_test_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = add_os(Machine())
+
+    @add_test
+    async def test_with_helper(guest: Guest = use(source)) -> None:
+        del guest
+        await _checkpoint_helper()
+
+    before = checkpoint_key(test_with_helper)
+    monkeypatch.setitem(
+        test_with_helper.function.__globals__,
+        "_checkpoint_helper",
+        _checkpoint_helper_second,
+    )
+
+    assert checkpoint_key(test_with_helper) != before
+
+
 def test_checkpoint_release_uses_the_test_function_directory(tmp_path: Path) -> None:
     source = add_os(Machine())
     published: list[Path] = []
@@ -309,6 +359,93 @@ def test_checkpoint_release_uses_the_test_function_directory(tmp_path: Path) -> 
         / "test_desktop_login"
     ]
     assert executor._start_count == 1
+
+
+def test_child_starts_only_after_its_parent_checkpoint_is_restored(
+    tmp_path: Path,
+) -> None:
+    source = add_os(Machine())
+
+    @add_test
+    async def boot(guest: Guest = use(source)) -> None:
+        del guest
+
+    @add_test
+    async def browser(guest: Guest = use(boot)) -> None:
+        del guest
+
+    graph = CatsnailTestGraph(roots=[browser])
+    checkpoints = CheckpointStore(tmp_path / "target")
+    asyncio.run(
+        _CheckpointExecutor(
+            graph,
+            target_dir=tmp_path / "target",
+            checkpoints=checkpoints,
+            restored=[],
+        ).run(boot)
+    )
+
+    events = []
+    asyncio.run(
+        _CheckpointExecutor(
+            graph,
+            target_dir=tmp_path / "target",
+            checkpoints=checkpoints,
+            restored=[],
+            reporter=events.append,
+        ).run(browser)
+    )
+
+    restored_boot = next(
+        index
+        for index, update in enumerate(events)
+        if update.kind == "checkpoint_restored" and update.node_id == boot.id
+    )
+    started_browser = next(
+        index
+        for index, update in enumerate(events)
+        if update.kind == "started" and update.node_id == browser.id
+    )
+    assert restored_boot < started_browser
+
+
+def test_restoring_a_cached_target_marks_its_dependencies_as_cached(
+    tmp_path: Path,
+) -> None:
+    source = add_os(Machine())
+
+    @add_test
+    async def boot(guest: Guest = use(source)) -> None:
+        del guest
+
+    @add_test(internal=True)
+    async def setup(guest: Guest = use(boot)) -> None:
+        del guest
+
+    @add_test
+    async def browser(guest: Guest = use(setup)) -> None:
+        del guest
+
+    target_dir = tmp_path / "target"
+    graph = CatsnailTestGraph(roots=[browser])
+    asyncio.run(
+        _CheckpointExecutor(
+            graph, target_dir=target_dir, restored=[]
+        ).run(browser)
+    )
+    events = []
+    asyncio.run(
+        _CheckpointExecutor(
+            graph, target_dir=target_dir, restored=[], reporter=events.append
+        ).run(browser)
+    )
+
+    cached_ids = {
+        update.node_id
+        for update in events
+        if update.kind == "checkpoint_restored"
+    }
+    assert {boot.id, setup.id, browser.id} <= cached_ids
 
 
 def test_artifact_directories_include_the_test_file_path(
@@ -456,3 +593,45 @@ def test_force_rebuilds_a_checkpoint_instead_of_restoring_it(tmp_path: Path) -> 
     # The second restoration is the fresh checkpoint's QEMU hand-off to terminal.
     assert restored == ["boot"]
     assert checkpoints.load(checkpoint_key(boot), name="boot") is not None
+
+
+def test_recorded_target_restores_its_cached_checkpoint(tmp_path: Path) -> None:
+    source = add_os(Machine())
+    calls: list[str] = []
+
+    @add_test
+    async def boot(guest: Guest = use(source)) -> None:
+        calls.append("boot")
+        del guest
+
+    @add_test
+    async def browser(guest: Guest = use(boot)) -> None:
+        calls.append("browser")
+        del guest
+
+    target_dir = tmp_path / "target"
+    checkpoints = CheckpointStore(target_dir)
+    graph = CatsnailTestGraph(roots=[browser])
+    asyncio.run(
+        _CheckpointExecutor(
+            graph,
+            target_dir=target_dir,
+            checkpoints=checkpoints,
+            restored=[],
+            record=False,
+        ).run(browser)
+    )
+
+    restored: list[str] = []
+    asyncio.run(
+        _CheckpointExecutor(
+            graph,
+            target_dir=target_dir,
+            checkpoints=checkpoints,
+            restored=restored,
+            record=True,
+        ).run(browser)
+    )
+
+    assert calls == ["boot", "browser"]
+    assert restored == []

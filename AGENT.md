@@ -17,6 +17,10 @@ QEMU lifecycle, snapshots, VNC, serial, and network details remain internal.
 - Keep generic guest controls in `Guest`. Put distribution-specific behavior
   in a concrete adapter such as `DebianAdapter`; do not introduce a speculative
   cross-distribution abstraction.
+- Express every visible acceptance state with `screen.assert_screen(...)`.
+  It publishes the exact matching full-screen PNG automatically; do not add a
+  separate capture step. Use `screen.snapshot()` only when a control flow must
+  compare a later framebuffer with its starting point.
 - Preserve Pylance/Pyright inference. Dynamic decorator behavior needs typed
   overloads and collection-time validation, not `Any` or ignored errors.
 
@@ -60,3 +64,20 @@ uv run pyright
 uv run pytest -q
 uv run catsnail run examples --dry-run
 ```
+
+For a GUI scenario under active development, select just that node and skip
+per-input recording. Its prerequisite checkpoints still restore, while every
+`assert_screen` result remains in `target/release`:
+
+```bash
+uv run catsnail run integration-ubuntu/ruyisdk_ide.py \
+  --test '^测试RuyiSDK项目模板$' --no-record --progress plain
+```
+
+For a new GUI scenario or a failing GUI test, first restore the nearest useful
+checkpoint with `catsnail studio start ... --stdio`. Keep that single process
+open while inspecting frames and issuing JSON Lines control requests; finish
+with `session.emit`, stop it, write only the verified actions and fixtures back
+to the source scenario, then validate that source change with ordinary
+`catsnail run`. Studio is for fast discovery; `run` is the repeatable delivery
+path and the only place that produces the final release recording.

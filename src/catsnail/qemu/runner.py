@@ -10,8 +10,10 @@ import shlex
 import shutil
 import stat
 import string
+import weakref
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Literal
 
 from ..graph.api import Machine
 from ..image import ImageError, resolve_iso
@@ -30,15 +32,60 @@ class QemuRunError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class QemuNetwork:
-    """QEMU network devices for one live guest.
+class QemuLaunchOptions:
+    """Optional host-side QEMU settings used for reproducible benchmarks.
 
-    The localhost control endpoint is forwarded through a declared ``NetUser``
-    NIC when one is available. Otherwise Catsnail adds a private SLIRP NIC
-    solely for that endpoint.
+    Catsnail requires KVM by default. TCG is an explicit opt-in for a
+    deliberate emulation run, such as a future cross-architecture backend.
+    Its tuning settings cannot silently affect a KVM run.
     """
 
-    control_port: int
+    executable: str = "qemu-system-x86_64"
+    acceleration: Literal["kvm", "tcg"] = "kvm"
+    tcg_thread: Literal["single", "multi"] | None = None
+    tcg_tb_size: int | None = None
+    hugepage_path: Path | None = None
+    qemu_img_executable: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.executable.strip():
+            raise ValueError("QEMU executable must not be empty")
+        if self.acceleration not in {"kvm", "tcg"}:
+            raise ValueError(f"unsupported QEMU acceleration: {self.acceleration}")
+        if self.acceleration != "tcg" and (
+            self.tcg_thread is not None or self.tcg_tb_size is not None
+        ):
+            raise ValueError("TCG options require acceleration='tcg'")
+        if self.tcg_tb_size is not None and self.tcg_tb_size < 1:
+            raise ValueError("TCG translation cache size must be positive")
+
+    def checkpoint_identity(self) -> dict[str, str | int] | None:
+        """Return launch settings that must isolate VM checkpoints."""
+
+        if self == QemuLaunchOptions():
+            return None
+        identity: dict[str, str | int] = {
+            "executable": str(Path(self.executable).expanduser().resolve()),
+            "acceleration": self.acceleration,
+        }
+        try:
+            executable_stat = Path(self.executable).expanduser().resolve().stat()
+        except OSError:
+            executable_stat = None
+        if executable_stat is not None:
+            identity["executable_size"] = executable_stat.st_size
+            identity["executable_mtime_ns"] = executable_stat.st_mtime_ns
+        if self.tcg_thread is not None:
+            identity["tcg_thread"] = self.tcg_thread
+        if self.tcg_tb_size is not None:
+            identity["tcg_tb_size_mib"] = self.tcg_tb_size
+        if self.hugepage_path is not None:
+            identity["hugepage_path"] = str(self.hugepage_path.resolve())
+        if self.qemu_img_executable is not None:
+            identity["qemu_img_executable"] = str(
+                Path(self.qemu_img_executable).expanduser().resolve()
+            )
+        return identity
 
 
 @dataclass
@@ -50,8 +97,20 @@ class QemuProcess:
 
 
 class QemuRunner:
-    def __init__(self, executable: str = "qemu-system-x86_64") -> None:
-        self.executable = executable
+    _instances: weakref.WeakSet[QemuRunner] = weakref.WeakSet()
+
+    def __init__(
+        self,
+        executable: str = "qemu-system-x86_64",
+        *,
+        options: QemuLaunchOptions | None = None,
+    ) -> None:
+        if options is not None and executable != "qemu-system-x86_64":
+            raise ValueError("pass the QEMU executable through options or executable, not both")
+        self.options = options or QemuLaunchOptions(executable=executable)
+        self.executable = self.options.executable
+        self._active: dict[int, QemuProcess] = {}
+        self._instances.add(self)
 
     def build_command(
         self,
@@ -60,17 +119,24 @@ class QemuRunner:
         *,
         guest_name: str | None = None,
         vnc: bool = False,
-        network: QemuNetwork | None = None,
+        guest_control_port: int | None = None,
         network_attachments: tuple[NetworkAttachment, ...] = (),
         state_disk: Path | None = None,
         incoming_state: Path | None = None,
     ) -> list[str]:
-        command = [
-            self.executable,
-            "-name",
-            guest_name or _random_guest_name(),
-            "-machine",
-            "accel=kvm:tcg",
+        command = [self.executable, "-name", guest_name or _random_guest_name()]
+        if self.options.acceleration == "kvm":
+            command.extend(["-machine", "accel=kvm"])
+        else:
+            # ``-accel`` cannot be combined with ``-machine accel=...``.
+            # The default x86 machine is explicit here for stable repro scripts.
+            command.extend(["-machine", "pc", "-accel", "tcg"])
+            if self.options.tcg_thread is not None:
+                command[-1] += f",thread={self.options.tcg_thread}"
+            if self.options.tcg_tb_size is not None:
+                command[-1] += f",tb-size={self.options.tcg_tb_size}"
+        command.extend(
+            [
             "-m",
             machine.memory,
             "-smp",
@@ -87,7 +153,16 @@ class QemuRunner:
             "isa-serial,chardev=catsnail-serial",
             "-qmp",
             f"unix:{artifacts.qmp_socket},server=on,wait=off",
-        ]
+            ]
+        )
+        if self.options.hugepage_path is not None:
+            command.extend(
+                [
+                    "-mem-path",
+                    str(self.options.hugepage_path),
+                    "-mem-prealloc",
+                ]
+            )
         if machine.iso is not None:
             command.extend(["-cdrom", str(machine.iso), "-boot", "order=d"])
         if state_disk is not None:
@@ -99,12 +174,13 @@ class QemuRunner:
             )
         elif machine.disk is not None:
             command.extend(["-drive", f"file={machine.disk},if=virtio"])
-        control_on_user_nic = network is not None and any(
-            isinstance(attachment, UserAttachment)
-            for attachment in network_attachments
+        control_on_user_nic = guest_control_port is not None and any(
+            isinstance(attachment, UserAttachment) for attachment in network_attachments
         )
-        if network is not None and not control_on_user_nic:
-            host_forwards = [f"hostfwd=tcp:127.0.0.1:{network.control_port}-:8123"]
+        if guest_control_port is not None and not control_on_user_nic:
+            host_forwards = [
+                f"hostfwd=tcp:127.0.0.1:{guest_control_port}-:8123"
+            ]
             command.extend(
                 [
                     "-netdev",
@@ -134,9 +210,9 @@ class QemuRunner:
                 netdev_id = f"user{user_index}"
                 user_index += 1
                 options = [f"id={netdev_id}", f"net={attachment.subnet}"]
-                if network is not None and not control_forwarded:
+                if guest_control_port is not None and not control_forwarded:
                     options.append(
-                        f"hostfwd=tcp:127.0.0.1:{network.control_port}-:8123"
+                        f"hostfwd=tcp:127.0.0.1:{guest_control_port}-:8123"
                     )
                     control_forwarded = True
                 command.extend(
@@ -148,7 +224,19 @@ class QemuRunner:
                     ]
                 )
         if vnc:
-            command.extend(["-vnc", f"unix:{artifacts.vnc_socket}"])
+            # An absolute USB tablet keeps VNC coordinates stable in desktop
+            # guests. Without it QEMU exposes the legacy PS/2 mouse path,
+            # whose relative-motion translation can miss SWT table controls.
+            command.extend(
+                [
+                    "-device",
+                    "piix3-usb-uhci,id=catsnail-usb",
+                    "-device",
+                    "usb-tablet,bus=catsnail-usb.0",
+                    "-vnc",
+                    f"unix:{artifacts.vnc_socket}",
+                ]
+            )
         if incoming_state is not None:
             # A compressed migration stream requires the destination to
             # advertise decompression before it begins reading the file.
@@ -162,7 +250,7 @@ class QemuRunner:
         *,
         guest_name: str | None = None,
         vnc: bool = False,
-        network: QemuNetwork | None = None,
+        guest_control_port: int | None = None,
         network_attachments: tuple[NetworkAttachment, ...] = (),
         state_disk: Path | None = None,
         incoming_state: Path | None = None,
@@ -175,7 +263,7 @@ class QemuRunner:
                 artifacts,
                 guest_name=guest_name,
                 vnc=vnc,
-                network=network,
+                guest_control_port=guest_control_port,
                 network_attachments=network_attachments,
                 state_disk=state_disk,
                 incoming_state=incoming_state,
@@ -189,7 +277,7 @@ class QemuRunner:
             artifacts,
             guest_name=guest_name,
             vnc=vnc,
-            network=network,
+            guest_control_port=guest_control_port,
             network_attachments=network_attachments,
             state_disk=state_disk,
             incoming_state=incoming_state,
@@ -212,24 +300,59 @@ class QemuRunner:
             raise QemuRunError(
                 f"QEMU state image not found: {incoming_state}", artifacts
             )
+        if self.options.hugepage_path is not None:
+            hugepage_path = self.options.hugepage_path
+            if not hugepage_path.is_dir():
+                raise QemuRunError(
+                    f"HugeTLB filesystem is not a directory: {hugepage_path}",
+                    artifacts,
+                )
+            if not os.access(hugepage_path, os.R_OK | os.W_OK | os.X_OK):
+                raise QemuRunError(
+                    f"HugeTLB filesystem is not accessible: {hugepage_path}",
+                    artifacts,
+                )
         stderr_handle = artifacts.stderr_log.open("wb")
-        try:
-            process = await asyncio.create_subprocess_exec(
+        start_task = asyncio.create_task(
+            asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=stderr_handle,
                 start_new_session=True,
             )
+        )
+        try:
+            # Shield the spawn itself so Ctrl-C cannot leave an untracked
+            # QEMU between fork and the return of create_subprocess_exec.
+            process = await asyncio.shield(start_task)
+        except asyncio.CancelledError:
+            try:
+                process = await start_task
+            except BaseException:
+                stderr_handle.close()
+                raise
+            stderr_handle.close()
+            running = QemuProcess(
+                process=process,
+                artifacts=artifacts,
+                command=command,
+                state_disk=state_disk,
+            )
+            self._active[process.pid] = running
+            await asyncio.shield(self.stop(running))
+            raise
         except OSError as error:
             stderr_handle.close()
             raise QemuRunError(f"failed to start QEMU: {error}", artifacts) from error
         stderr_handle.close()
-        return QemuProcess(
+        running = QemuProcess(
             process=process,
             artifacts=artifacts,
             command=command,
             state_disk=state_disk,
         )
+        self._active[process.pid] = running
+        return running
 
     async def create_overlay(
         self,
@@ -241,7 +364,7 @@ class QemuRunner:
     ) -> Path:
         """Create a sparse QCOW2 layer, optionally backed by a prior layer."""
 
-        executable = shutil.which("qemu-img")
+        executable = self._qemu_img_executable()
         if executable is None:
             raise QemuRunError("qemu-img executable not found", artifacts)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -275,7 +398,7 @@ class QemuRunner:
         return destination
 
     async def _image_format(self, image: Path, artifacts: RunArtifacts) -> str:
-        executable = shutil.which("qemu-img")
+        executable = self._qemu_img_executable()
         if executable is None:
             raise QemuRunError("qemu-img executable not found", artifacts)
         process = await asyncio.create_subprocess_exec(
@@ -305,25 +428,76 @@ class QemuRunner:
             )
         return image_format
 
+    def _qemu_img_executable(self) -> str | None:
+        """Resolve qemu-img beside a custom QEMU binary, then PATH."""
+
+        configured = self.options.qemu_img_executable
+        if configured is not None:
+            return shutil.which(configured)
+        qemu_path = Path(self.executable)
+        if qemu_path.parent != Path("."):
+            sibling = qemu_path.parent / "qemu-img"
+            if sibling.is_file() and os.access(sibling, os.X_OK):
+                return str(sibling)
+        return shutil.which("qemu-img")
+
     async def stop(self, running: QemuProcess) -> int:
-        if running.process.returncode is not None:
-            returncode = running.process.returncode
-        else:
+        stop_task = asyncio.create_task(self._stop_process(running))
+        try:
+            return await asyncio.shield(stop_task)
+        except asyncio.CancelledError:
+            # A second Ctrl-C must not interrupt cleanup between TERM and the
+            # process reaping step. Force the process group down, then finish
+            # waiting for the shielded task before propagating cancellation.
             try:
-                os.killpg(running.process.pid, 15)
+                os.killpg(running.process.pid, 9)
             except ProcessLookupError:
                 pass
             try:
-                returncode = await asyncio.wait_for(running.process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                try:
-                    os.killpg(running.process.pid, 9)
-                except ProcessLookupError:
-                    pass
-                returncode = await running.process.wait()
-        running.artifacts.qmp_socket.unlink(missing_ok=True)
-        running.artifacts.vnc_socket.unlink(missing_ok=True)
-        return returncode
+                await asyncio.shield(stop_task)
+            except BaseException:
+                stop_task.cancel()
+                await asyncio.gather(stop_task, return_exceptions=True)
+                raise
+            raise
+        finally:
+            if stop_task.done():
+                self._active.pop(running.process.pid, None)
+                running.artifacts.qmp_socket.unlink(missing_ok=True)
+                running.artifacts.vnc_socket.unlink(missing_ok=True)
+
+    async def _stop_process(self, running: QemuProcess) -> int:
+        if running.process.returncode is not None:
+            return running.process.returncode
+        try:
+            os.killpg(running.process.pid, 15)
+        except ProcessLookupError:
+            pass
+        try:
+            return await asyncio.wait_for(running.process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            try:
+                os.killpg(running.process.pid, 9)
+            except ProcessLookupError:
+                pass
+            return await running.process.wait()
+
+    async def stop_all(self) -> None:
+        """Stop every QEMU process started by this runner instance."""
+
+        await asyncio.gather(
+            *(self.stop(running) for running in tuple(self._active.values())),
+            return_exceptions=True,
+        )
+
+    @classmethod
+    async def stop_all_instances(cls) -> None:
+        """Stop QEMU processes owned by the current Catsnail process."""
+
+        await asyncio.gather(
+            *(runner.stop_all() for runner in tuple(cls._instances)),
+            return_exceptions=True,
+        )
 
     @staticmethod
     def _write_reproduction(command: list[str], artifacts: RunArtifacts) -> None:
@@ -353,9 +527,7 @@ class QemuRunner:
         script = running.artifacts.directory / "resume.sh"
         script.write_text(
             "#!/bin/sh\n"
-            "set -eu\n"
-            + shlex.join(command)
-            + " &\n"
+            "set -eu\n" + shlex.join(command) + " &\n"
             "qemu_pid=$!\n"
             "trap 'kill \"$qemu_pid\" 2>/dev/null || true' EXIT INT TERM\n"
             "python3 - "
@@ -380,34 +552,34 @@ class QemuRunner:
             "            raise\n"
             "        time.sleep(0.1)\n"
             "def execute(command, arguments=None):\n"
-            "    request = {\"execute\": command}\n"
+            '    request = {"execute": command}\n'
             "    if arguments is not None:\n"
-            "        request[\"arguments\"] = arguments\n"
+            '        request["arguments"] = arguments\n'
             "    connection.sendall(json.dumps(request).encode() + b'\\r\\n')\n"
-            "    file = connection.makefile(\"rb\")\n"
+            '    file = connection.makefile("rb")\n'
             "    while True:\n"
             "        response = json.loads(file.readline())\n"
-            "        if \"return\" in response:\n"
-            "            return response[\"return\"]\n"
-            "        if \"error\" in response:\n"
-            "            raise RuntimeError(response[\"error\"])\n"
+            '        if "return" in response:\n'
+            '            return response["return"]\n'
+            '        if "error" in response:\n'
+            '            raise RuntimeError(response["error"])\n'
             "\n"
-            "execute(\"qmp_capabilities\")\n"
-            "execute(\"migrate-set-capabilities\", {\"capabilities\": [\n"
-            "    {\"capability\": \"compress\", \"state\": True}\n"
+            'execute("qmp_capabilities")\n'
+            'execute("migrate-set-capabilities", {"capabilities": [\n'
+            '    {"capability": "compress", "state": True}\n'
             "]})\n"
-            "execute(\"migrate-incoming\", {\"uri\": incoming})\n"
+            'execute("migrate-incoming", {"uri": incoming})\n'
             "while True:\n"
-            "    status = execute(\"query-status\")\n"
-            "    if status.get(\"status\") == \"paused\":\n"
+            '    status = execute("query-status")\n'
+            '    if status.get("status") == "paused":\n'
             "        break\n"
             "    if time.monotonic() >= deadline:\n"
-            "        raise RuntimeError(f\"QEMU did not restore: {status}\")\n"
+            '        raise RuntimeError(f"QEMU did not restore: {status}")\n'
             "    time.sleep(0.1)\n"
-            "execute(\"cont\")\n"
+            'execute("cont")\n'
             "connection.close()\n"
             "PY\n"
-            "wait \"$qemu_pid\"\n",
+            'wait "$qemu_pid"\n',
             encoding="utf-8",
         )
         script.chmod(script.stat().st_mode | stat.S_IXUSR)

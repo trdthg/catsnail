@@ -13,9 +13,25 @@ uv sync --group dev
 uv run catsnail doctor
 ```
 
-`doctor` requires `qemu-system-x86_64` and `qemu-img`. KVM access and `ffmpeg`
-are optional: without KVM QEMU uses TCG, and without ffmpeg Catsnail keeps PNG
-keyframes rather than producing an MP4.
+`doctor` requires `qemu-system-x86_64`, `qemu-img`, and accessible `/dev/kvm`.
+Catsnail runs x86 desktop guests with KVM by default. `ffmpeg` remains optional:
+without it Catsnail keeps PNG keyframes rather than producing an MP4.
+
+For a reproducible QEMU build or a deliberate TCG benchmark, select the
+executable and accelerator explicitly:
+
+```bash
+uv run catsnail run examples/minimal.py \
+  --qemu /opt/qemu/bin/qemu-system-x86_64 \
+  --accel tcg --tcg-thread multi --tcg-tb-size 1024
+```
+
+`--tcg-tb-size` is measured in MiB. The TCG options are rejected unless
+`--accel tcg` is selected. Use it only for an intentional emulation run: an
+`x86_64` host cannot accelerate a RISC-V guest with KVM. HugeTLB can be tested
+explicitly with `--hugepages /dev/hugepages`. Catsnail uses `-mem-prealloc` in
+that mode so an undersized or unconfigured HugeTLB pool fails at startup
+instead of producing a misleading partial run.
 
 ## One Desktop
 
@@ -94,9 +110,10 @@ matching full-screen PNG, and recordings are published under
 ## Fast Iteration
 
 During GUI test authoring, rerun only the node being edited. Catsnail restores
-the nearest valid prerequisite checkpoint, so it does not boot the OS or repeat
-the IDE installation. `--no-record` skips the dense per-input keyframes and
-MP4 work; successful `assert_screen(...)` calls still save their verified PNGs.
+any valid checkpoint, including that selected test, so an unchanged passing
+test does not start QEMU again. `--no-record` skips dense per-input keyframes
+and MP4 work for tests that actually execute; successful `assert_screen(...)`
+calls still save their verified PNGs.
 
 ```bash
 uv run catsnail run integration-ubuntu/ruyisdk_ide.py \
@@ -105,9 +122,9 @@ uv run catsnail run integration-ubuntu/ruyisdk_ide.py \
 
 Write one `assert_screen(...)` for each stable UI state. It waits for the
 fixture, validates it, and writes the same matched framebuffer to release.
-When the scenario is ready for delivery, rerun it without `--no-record` to add
-the step recording and MP4. A code change invalidates only that test's
-checkpoint and descendants; unchanged prerequisites remain reusable.
+Use `--force` to deliberately rerun a cached scenario and regenerate its step
+recording and MP4. A code change invalidates only that test's checkpoint and
+descendants; unchanged prerequisites remain reusable.
 
 ## Multiple Machines
 
@@ -181,11 +198,49 @@ report under `target/studio/generated/`. The draft intentionally leaves the
 original `add_os(...)` declaration for the user to connect, so Studio never
 overwrites a test file or silently changes a checked-in scenario.
 
-For an AI or editor integration, `studio start --serve` exposes the same
-operations as newline-delimited JSON on the session's Unix socket. Requests
-such as `screen.snapshot`, `screen.click`, `keyboard.type`,
-`keyboard.press`, and `screen.wait_stable` return frame paths, dimensions,
-revision numbers, and SHA-256 digests instead of embedding large base64 images.
+For test authoring or debugging, prefer one interactive standard-I/O session:
+
+```bash
+uv run catsnail studio start integration-ubuntu/ruyisdk_ide.py \
+  --from 测试RuyiSDK自动检测与安装Ruyi --stdio
+```
+
+It speaks one JSON object per input and output line. The first output is a
+`ready` event. Send the same request objects used by the Unix-socket API, such
+as `{"method":"screen.snapshot"}`, `{"method":"screen.click","params":{"x":431,"y":69}}`,
+and `{"method":"session.emit","params":{"name":"ruyi-demo"}}`. End with
+`{"method":"session.stop"}`. Catsnail records each operation and framebuffer
+before stopping the guest; copy the verified actions and fixtures from the
+emitted draft, then use `catsnail run` for the recorded delivery run.
+
+`studio start --serve` remains available for editor integrations that need the
+same newline-delimited JSON protocol on the session's Unix socket. Both
+transports return frame paths, dimensions, revision numbers, and SHA-256
+digests instead of embedding large base64 images.
+
+## AI-Guided Exploration
+
+`explore` gives the system `codex` executable a product-test specification and
+an existing Catsnail checkpoint. It temporarily registers a local
+`catsnail_studio` MCP server for that Codex process. The server exposes a small
+visual tool set: each snapshot or input action returns the current PNG and a
+revision, and input actions reject stale revisions. This keeps the agent in a
+closed screenshot -> one action -> screenshot loop without asking it to learn
+CLI flags or shell JSON protocols. The temporary server is not written to the
+user's Codex configuration.
+
+```bash
+uv run catsnail explore integration-ubuntu/README.md \
+  integration-ubuntu/ruyisdk_ide.py \
+  --from 测试RuyiSDK工作台已就绪
+```
+
+The task text defines the feature under test. `--from` is deliberately
+required: exploration is based on a known-good checkpoint rather than an
+ambiguous cold boot. The Codex operating prompt and its final report are saved
+under `target/release/explore/<task-name>/`. Inspect the planned invocation
+without starting Codex with `--dry-run`; the printed command includes the
+temporary MCP server configuration.
 
 ## Serial Terminal
 
@@ -229,7 +284,7 @@ command and available output in the test failure.
 
 ```bash
 catsnail doctor
-catsnail run PATH [--test PATTERN] [--jobs N] [--progress auto|tree|plain] [--force] [--no-record]
+catsnail run PATH [--test PATTERN] [--jobs N] [--progress tree|auto|plain] [--force] [--fail-fast] [--no-record] [--no-web]
 catsnail run PATH --dry-run
 catsnail prune PATH
 catsnail studio start PATH --from TEST
@@ -253,11 +308,16 @@ collected ID: `test_desktop_login` works as before, while
 `'^test_(browser|ssh).*'` selects both matching scenarios. Use `^...$` for an
 exact name match.
 
-Progress defaults to `auto`: an interactive terminal redraws the selected test
-DAG as a live tree, while redirected output and CI receive append-only
-`RUN`/`PASS`/`FAIL` lines. Use `--progress tree` to force the live view or
-`--progress plain` for line-oriented logs. Independent branches honor
-`--jobs`; dependent checkpoint tests stay ordered in the tree.
+Progress defaults to `tree`: the selected test DAG is redrawn with live
+durations. Use `--progress plain` for line-oriented logs or `--progress auto`
+to select based on the terminal. A LAN Dashboard is also enabled by default;
+it listens on all interfaces, prints a reachable URL, and shows each active
+Guest's VNC framebuffer and test status. Use `--no-web` for CI or `--web-port
+N` to choose its port.
+Independent branches honor `--jobs`; dependent checkpoint tests stay ordered
+in the tree. After a failure, Catsnail continues independent branches by
+default and cancels only consumers of the failed checkpoint. Use `--fail-fast`
+to stop all remaining work after the first failure.
 
 The live tree colors `PASS` green, `FAIL` red, `WAIT` yellow, and `RUN` bright
 cyan. Set `NO_COLOR` to retain the live layout without ANSI color codes.

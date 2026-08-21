@@ -33,7 +33,7 @@ XFCE_PANEL = Path(__file__).parent / "assets" / "xfce-panel.png"
 async def test_desktop_boot(desktop: Guest = use(DEBIAN_DESKTOP)):
     """Wait for the visible username and password fields."""
 
-    await desktop.screen.wait_for_image(
+    await desktop.screen.assert_screen(
         LIGHTDM_CREDENTIALS,
         x=589,
         y=343,
@@ -49,10 +49,10 @@ async def test_desktop_login(desktop: Guest = use(test_desktop_boot)):
     await desktop.keyboard.press("TAB")
     await desktop.keyboard.type("live")
     await desktop.keyboard.press("ENTER")
-    await desktop.screen.wait_for_image(
+    await desktop.screen.assert_screen(
         XFCE_PANEL,
         x=0,
         y=0,
         timeout=120,
+        label="desktop",
     )
-    await desktop.screen.capture("desktop")

@@ -148,9 +148,21 @@ def test_vnc_click_holds_the_button_until_the_next_compositor_tick() -> None:
     writes = asyncio.run(exercise())
 
     assert writes == [
+        struct.pack(">BBHH", 5, 0, 10, 20),
         struct.pack(">BBHH", 5, 1, 10, 20),
         struct.pack(">BBHH", 5, 0, 10, 20),
     ]
+
+
+def test_vnc_paste_uses_rfb_clipboard_and_ctrl_v() -> None:
+    async def exercise() -> list[bytes]:
+        writer = _Writer()
+        client = VncClient(asyncio.StreamReader(), cast(asyncio.StreamWriter, writer))
+        await client.paste_text("hello")
+        return writer.writes
+
+    writes = asyncio.run(exercise())
+    assert writes[0] == struct.pack(">BxxxI", 6, 5) + b"hello"
 
 
 def test_vnc_middle_click_uses_the_primary_selection_button() -> None:
@@ -163,7 +175,24 @@ def test_vnc_middle_click_uses_the_primary_selection_button() -> None:
         return writer.writes
 
     assert asyncio.run(exercise()) == [
+        struct.pack(">BBHH", 5, 0, 10, 20),
         struct.pack(">BBHH", 5, 2, 10, 20),
+        struct.pack(">BBHH", 5, 0, 10, 20),
+    ]
+
+
+def test_vnc_right_click_uses_the_context_menu_button() -> None:
+    async def exercise() -> list[bytes]:
+        writer = _Writer()
+        client = VncClient(asyncio.StreamReader(), cast(asyncio.StreamWriter, writer))
+        client.width = 1280
+        client.height = 800
+        await client.click(10, 20, button=3)
+        return writer.writes
+
+    assert asyncio.run(exercise()) == [
+        struct.pack(">BBHH", 5, 0, 10, 20),
+        struct.pack(">BBHH", 5, 4, 10, 20),
         struct.pack(">BBHH", 5, 0, 10, 20),
     ]
 
@@ -225,6 +254,37 @@ def test_vnc_move_sends_an_unpressed_pointer_event() -> None:
         return writer.writes
 
     assert asyncio.run(exercise()) == [struct.pack(">BBHH", 5, 0, 10, 20)]
+
+
+def test_vnc_scrolls_with_standard_rfb_wheel_buttons() -> None:
+    async def exercise() -> list[bytes]:
+        writer = _Writer()
+        client = VncClient(asyncio.StreamReader(), cast(asyncio.StreamWriter, writer))
+        client.width = 1280
+        client.height = 800
+        await client.scroll(10, 20, 2)
+        await client.scroll(10, 20, -1)
+        return writer.writes
+
+    assert asyncio.run(exercise()) == [
+        struct.pack(">BBHH", 5, 0, 10, 20),
+        struct.pack(">BBHH", 5, 8, 10, 20),
+        struct.pack(">BBHH", 5, 8, 10, 20),
+        struct.pack(">BBHH", 5, 0, 10, 20),
+        struct.pack(">BBHH", 5, 16, 10, 20),
+    ]
+
+
+def test_vnc_scroll_ignores_zero_amount() -> None:
+    async def exercise() -> list[bytes]:
+        writer = _Writer()
+        client = VncClient(asyncio.StreamReader(), cast(asyncio.StreamWriter, writer))
+        client.width = 1280
+        client.height = 800
+        await client.scroll(10, 20, 0)
+        return writer.writes
+
+    assert asyncio.run(exercise()) == []
 
 
 def test_vnc_press_holds_a_key_through_one_controller_tick(

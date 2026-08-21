@@ -60,13 +60,13 @@ async def test_ssh_pod(
     client: Guest = use(CLIENT),
 ):
     await asyncio.gather(
-        server.screen.wait_for_image(
+        server.screen.assert_screen(
             XFCE_PANEL,
             x=0,
             y=0,
             timeout=120,
         ),
-        client.screen.wait_for_image(
+        client.screen.assert_screen(
             XFCE_PANEL,
             x=0,
             y=0,
@@ -105,11 +105,20 @@ async def test_ssh_pod(
         capture_output=True,
     )
     await asyncio.sleep(3)
-    password_prompt = await client.screen.capture("ssh-password-prompt")
+    password_prompt = await client.screen.snapshot()
     await client.keyboard.type(LIVE_PASSWORD)
     await client.keyboard.press("ENTER")
     await command.wait(timeout=90)
-    await command.output(timeout=30)
+    output = await command.output(timeout=30)
+    if "CATSNAIL_SSH_OK" not in output:
+        raise RuntimeError(f"SSH command output did not contain success marker: {output!r}")
     await client.screen.wait_for_change(password_prompt, timeout=15)
     await debian_client.terminal.run("printf 'CATSNAIL_SSH_OK\\n'", timeout=30)
-    await client.screen.capture("ssh-complete")
+    await asyncio.gather(
+        server.screen.assert_screen(
+            XFCE_PANEL, x=0, y=0, timeout=30, label="ssh-server-ready"
+        ),
+        client.screen.assert_screen(
+            XFCE_PANEL, x=0, y=0, timeout=30, label="ssh-client-complete"
+        ),
+    )

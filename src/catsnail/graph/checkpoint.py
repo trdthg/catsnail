@@ -16,10 +16,10 @@ from typing import Any, Iterable, Mapping
 from .api import Machine, Node, Source, TestNode
 
 
-# QEMU device topology is part of a migration-state ABI. Increment this when
-# Catsnail changes the command line in a way that prevents old VM snapshots
-# from being resumed safely.
-CHECKPOINT_FORMAT = 3
+# QEMU device topology and accelerator selection are part of a migration-state
+# ABI. Increment this when Catsnail changes either in a way that prevents old
+# VM snapshots from being resumed safely.
+CHECKPOINT_FORMAT = 5
 
 
 class CheckpointError(RuntimeError):
@@ -207,7 +207,9 @@ def _remove_cache_path(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def checkpoint_key(node: TestNode[Any]) -> str:
+def checkpoint_key(
+    node: TestNode[Any], *, runtime: Mapping[str, Any] | None = None
+) -> str:
     """Compute a reproducible cache key without persisting input values."""
 
     memo: dict[str, dict[str, Any]] = {}
@@ -228,6 +230,8 @@ def checkpoint_key(node: TestNode[Any]) -> str:
                 "id": current.id,
                 "code": _function_payload(current.function),
                 "inputs": _normalise(current.inputs),
+                "internal": current.internal,
+                "expected_failure": current.expected_failure,
                 "dependencies": {
                     name: describe(dependency.node)
                     for name, dependency in sorted(current.dependencies.items())
@@ -236,8 +240,11 @@ def checkpoint_key(node: TestNode[Any]) -> str:
         memo[current.id] = payload
         return payload
 
+    payload: dict[str, Any] = {"format": CHECKPOINT_FORMAT, "node": describe(node)}
+    if runtime is not None:
+        payload["runtime"] = _normalise(runtime)
     encoded = json.dumps(
-        {"format": CHECKPOINT_FORMAT, "node": describe(node)},
+        payload,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -265,14 +272,45 @@ def _machine_payload(machine: Machine) -> dict[str, Any]:
 
 
 def _function_payload(function: Any) -> dict[str, Any]:
+    filename = _function_file(function)
+    return _function_closure_payload(function, filename, active=frozenset())
+
+
+def _function_closure_payload(
+    function: Any,
+    filename: Path,
+    *,
+    active: frozenset[str],
+) -> dict[str, Any]:
+    """Describe a test and its same-module helper functions recursively."""
+
+    identity = f"{function.__module__}.{function.__qualname__}"
+    if identity in active:
+        return {"function": identity, "recursive": True}
     try:
         source = inspect.getsource(function)
     except (OSError, TypeError):
         source = None
-    filename = _function_file(function)
+    helpers: dict[str, dict[str, Any]] = {}
+    globals_map = getattr(function, "__globals__", {})
+    code = getattr(function, "__code__", None)
+    if code is not None and isinstance(globals_map, Mapping):
+        for name in sorted(set(code.co_names)):
+            helper = globals_map.get(name)
+            if (
+                inspect.isfunction(helper)
+                and _function_file(helper) == filename
+            ):
+                helpers[name] = _function_closure_payload(
+                    helper,
+                    filename,
+                    active=active | {identity},
+                )
     return {
+        "function": identity,
         "source": source,
         "module_file": str(filename),
+        "helpers": helpers,
     }
 
 

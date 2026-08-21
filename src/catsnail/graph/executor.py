@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from .api import (
     GraphDefinitionError,
@@ -27,8 +28,31 @@ from .checkpoint import (
 from ..guest import Guest
 from ..progress import EventSink, RunEvent, event
 from ..qemu.network import NetworkPool
-from ..qemu.runner import QemuRunError
+from ..qemu.runner import QemuLaunchOptions, QemuRunError
 from ..qemu.session import QemuSession, SourceRuntime
+
+
+class UnexpectedPassError(RuntimeError):
+    """Raised when a documented upstream defect no longer reproduces."""
+
+    def __init__(self, expected_failure: str) -> None:
+        super().__init__(f"expected failure passed: {expected_failure}")
+
+
+class ExpectedFailure(RuntimeError):
+    """Raised by a test after it has verified a documented upstream defect."""
+
+
+def xfail(reason: str = "") -> NoReturn:
+    """Mark the current expected-failure test as having reproduced its defect.
+
+    ``@add_test(expected_failure=...)`` declares the defect that must be
+    reproduced. A test reaches XFAIL only by calling this after it has asserted
+    the defective visible state; unrelated command, VNC, or fixture failures
+    therefore remain ordinary failures.
+    """
+
+    raise ExpectedFailure(reason)
 
 
 class TestExecutionError(RuntimeError):
@@ -37,11 +61,23 @@ class TestExecutionError(RuntimeError):
         target: TestNode[Any],
         cause: BaseException,
         guests: Iterable[Guest],
+        *,
+        failed_node: TestNode[Any] | None = None,
     ) -> None:
         detail = str(cause) or type(cause).__name__
         super().__init__(f"{target.id} failed: {detail}")
         self.target = target
         self.cause = cause
+        self.failed_node = failed_node
+        if failed_node is target and target.expected_failure is not None:
+            if isinstance(cause, ExpectedFailure):
+                self.outcome = "xfail"
+            elif isinstance(cause, UnexpectedPassError):
+                self.outcome = "xpass"
+            else:
+                self.outcome = "fail"
+        else:
+            self.outcome = "fail"
         artifacts = [guest.artifacts for guest in guests]
         debug = [guest.debug_directory for guest in guests]
         release = [guest.release_directory for guest in guests]
@@ -74,16 +110,24 @@ class GraphExecutor:
         coordinator: CheckpointCoordinator | None = None,
         reporter: EventSink | None = None,
         artifact_prefix: Path | None = None,
+        guest_observer: Callable[[str, Guest], None] | None = None,
+        qemu_options: QemuLaunchOptions | None = None,
     ) -> None:
         self.graph = graph
         self.target_dir = target_dir
         self.record = record
         self.force = force
-        self.session = QemuSession(target_dir=target_dir, record=record)
+        self.qemu_options = qemu_options or QemuLaunchOptions()
+        self.session = QemuSession(
+            target_dir=target_dir,
+            record=record,
+            qemu_options=qemu_options,
+        )
         self.checkpoints = checkpoints or CheckpointStore(target_dir)
         self.coordinator = coordinator or CheckpointCoordinator()
         self.reporter = reporter
         self.artifact_prefix = artifact_prefix
+        self.guest_observer = guest_observer
 
     def targets(self, selection: str | None = None) -> list[TestNode[Any]]:
         return select_test_targets(self.graph, selection)
@@ -122,29 +166,49 @@ class GraphExecutor:
 
             async def resolve_checkpoint(node: TestNode[Any]) -> Any:
                 nonlocal active_node
-                key = checkpoint_key(node)
+                key = self._checkpoint_key(node)
                 executed = False
                 result: Any = None
+
+                def emit_cached_dependencies(
+                    dependency_node: TestNode[Any], seen: set[str]
+                ) -> None:
+                    """Expose dependencies captured by a directly restored target."""
+
+                    for dependency in dependency_node.dependencies.values():
+                        child = dependency.node
+                        if not isinstance(child, TestNode) or child.id in seen:
+                            continue
+                        seen.add(child.id)
+                        emit_cached_dependencies(child, seen)
+                        self._emit(event("checkpoint_restored", child))
+
                 async with self.coordinator.lock_for(key):
                     cached = (
                         None
-                        if self.force
+                        if self.force or node.expected_failure is not None
                         else self.checkpoints.load(key, name=node.function.__name__)
                     )
                     if cached is None:
-                        active_node = node
-                        self._emit(event("started", node))
                         kwargs = {
                             parameter: await resolve_dependency(dependency)
                             for parameter, dependency in node.dependencies.items()
                         }
                         self._set_release_directories(node, kwargs)
+                        # A test starts only after its dependency checkpoints
+                        # have been restored. This keeps progress trees honest:
+                        # a child cannot appear running while its parent is
+                        # still waiting or being restored.
+                        active_node = node
+                        self._emit(event("started", node))
                         returned = await node.function(**kwargs)
                         if returned is not None:
                             raise GraphDefinitionError(
                                 f"{node.id} returned a value; @add_test functions "
                                 "must use implicit checkpoint state"
                             )
+                        if node.expected_failure is not None:
+                            raise UnexpectedPassError(node.expected_failure)
                         result = _implicit_output(kwargs)
                         completed.append(node)
                         cached = await self._publish_checkpoint(
@@ -154,6 +218,7 @@ class GraphExecutor:
                         self._emit(event("checkpoint_saved", node))
                     if node is target:
                         if not executed:
+                            emit_cached_dependencies(node, {node.id})
                             self._emit(event("checkpoint_restored", node))
                             active_node = None
                             return None
@@ -187,15 +252,31 @@ class GraphExecutor:
                 completed=tuple(completed),
                 artifacts=artifacts,
             )
+        except asyncio.CancelledError:
+            # The scheduler requested an intentional stop. It is neither a
+            # guest failure nor a test failure, so do not publish diagnostics
+            # or turn the cancelled active setup step into FAIL.
+            raise
         except BaseException as error:
             failed = True
             if active_node is not None:
-                self._emit(event("failed", active_node, detail=str(error)))
+                if active_node is target and target.expected_failure is not None and isinstance(
+                    error, (ExpectedFailure, UnexpectedPassError)
+                ):
+                    kind = "xpass" if isinstance(error, UnexpectedPassError) else "xfail"
+                    detail = target.expected_failure
+                    if kind == "xfail":
+                        detail = f"{detail}: {str(error) or type(error).__name__}"
+                    self._emit(event(kind, active_node, detail=detail))
+                else:
+                    self._emit(event("failed", active_node, detail=str(error)))
             guests = [runtime.guest for runtime in runtimes.values()]
             await _capture_failures(guests)
             await self._save_failure_states(runtimes.values())
             _write_failure_details(guests, error)
-            raise TestExecutionError(target, error, guests) from error
+            raise TestExecutionError(
+                target, error, guests, failed_node=active_node
+            ) from error
         finally:
             for runtime in reversed(list(runtimes.values())):
                 await self._dispose_runtime(runtime, retain=failed or self.record)
@@ -234,6 +315,12 @@ class GraphExecutor:
                 suffix = parameter if len(guests) == 1 else f"{parameter}-{index}"
                 guest.set_release_directory(directory / _safe_component(suffix))
 
+    def _checkpoint_key(self, node: TestNode[Any]) -> str:
+        return checkpoint_key(
+            node,
+            runtime=self.qemu_options.checkpoint_identity(),
+        )
+
     async def _publish_checkpoint(
         self,
         node: TestNode[Any],
@@ -253,7 +340,7 @@ class GraphExecutor:
                 f"{node.id} returned guests not owned by this test: {missing}"
             )
 
-        key = checkpoint_key(node)
+        key = self._checkpoint_key(node)
         staging = self.checkpoints.staging_directory(key, name=node.function.__name__)
         machines: list[dict[str, str]] = []
         try:
@@ -359,7 +446,7 @@ class GraphExecutor:
         target: TestNode[Any],
         stage: Node,
     ) -> SourceRuntime:
-        return await self.session.start(
+        runtime = await self.session.start(
             source,
             network_pool=network_pool,
             relative_directory=(
@@ -370,8 +457,13 @@ class GraphExecutor:
             backing=backing,
             incoming_state=incoming_state,
         )
+        if self.guest_observer is not None:
+            self.guest_observer("started", runtime.guest)
+        return runtime
 
     async def _dispose_runtime(self, runtime: SourceRuntime, *, retain: bool) -> None:
+        if self.guest_observer is not None:
+            self.guest_observer("stopped", runtime.guest)
         await self.session.dispose(runtime, retain=retain)
 
     async def _save_failure_states(self, runtimes: Iterable[SourceRuntime]) -> None:

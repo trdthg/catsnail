@@ -10,11 +10,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..graph.api import GraphDefinitionError, Network, Source
-from ..guest import Guest, NetworkInterface
+from ..guest import Guest, NetworkInterface, NetworkLink
 from .artifacts import RunArtifacts
-from .network import NetworkPool, SocketAttachment
+from .network import NetworkPool, SocketAttachment, UserAttachment
 from .qmp import QmpClient
-from .runner import QemuNetwork, QemuProcess, QemuRunError, QemuRunner
+from .runner import (
+    QemuLaunchOptions,
+    QemuProcess,
+    QemuRunError,
+    QemuRunner,
+)
 from .vnc import VncClient
 
 
@@ -37,10 +42,13 @@ class QemuSession:
         target_dir: Path,
         record: bool,
         runner: QemuRunner | None = None,
+        qemu_options: QemuLaunchOptions | None = None,
     ) -> None:
+        if runner is not None and qemu_options is not None:
+            raise ValueError("pass a runner or QEMU launch options, not both")
         self._target_dir = target_dir
         self._record = record
-        self._runner = runner or QemuRunner()
+        self._runner = runner or QemuRunner(options=qemu_options)
 
     async def start(
         self,
@@ -53,7 +61,7 @@ class QemuSession:
     ) -> SourceRuntime:
         """Start a source from a disk layer or restore its saved memory state."""
 
-        control_port = _free_port()
+        guest_control_port = _free_port()
         artifacts = RunArtifacts.create(
             self._target_dir,
             relative_directory=relative_directory,
@@ -72,7 +80,7 @@ class QemuSession:
             source.machine,
             artifacts,
             vnc=True,
-            network=QemuNetwork(control_port=control_port),
+            guest_control_port=guest_control_port,
             network_attachments=network_attachments,
             state_disk=state_disk,
             incoming_state=incoming_state,
@@ -91,7 +99,7 @@ class QemuSession:
                 source_id=source.id,
                 running=running,
                 vnc=vnc,
-                control_port=control_port,
+                control_port=guest_control_port,
                 interfaces=tuple(
                     _private_interface(network, attachment)
                     for network, attachment in zip(
@@ -99,6 +107,7 @@ class QemuSession:
                     )
                     if isinstance(attachment, SocketAttachment)
                 ),
+                links=_network_links(source.machine.networks, network_attachments),
                 record=self._record,
             )
             await guest.screen.record_step("guest-ready")
@@ -123,12 +132,22 @@ class QemuSession:
     async def dispose(self, runtime: SourceRuntime, *, retain: bool) -> None:
         """Close controls, stop QEMU, and optionally discard runtime artifacts."""
 
-        if not runtime.closed:
-            await runtime.guest.close()
-            runtime.closed = True
-        await self._runner.stop(runtime.running)
-        if not retain:
-            shutil.rmtree(runtime.running.artifacts.directory, ignore_errors=True)
+        try:
+            if not runtime.closed:
+                try:
+                    await runtime.guest.close()
+                finally:
+                    runtime.closed = True
+        finally:
+            # Guest controls (VNC, recorder, and close callbacks) are useful
+            # but must never be able to orphan their owning QEMU process.
+            try:
+                await self._runner.stop(runtime.running)
+            finally:
+                if not retain:
+                    shutil.rmtree(
+                        runtime.running.artifacts.directory, ignore_errors=True
+                    )
 
     async def save_failure_states(self, runtimes: Iterable[SourceRuntime]) -> None:
         """Keep exact per-guest resume points beside a failed test's artifacts."""
@@ -182,6 +201,26 @@ def _private_interface(
         subnet=network.subnet,
         mac=attachment.mac,
     )
+
+
+def _network_links(
+    networks: tuple[Network, ...],
+    attachments: tuple[SocketAttachment | UserAttachment, ...],
+) -> tuple[NetworkLink, ...]:
+    """Name QEMU NIC devices exactly as :class:`QemuRunner` creates them."""
+
+    socket_index = 0
+    user_index = 0
+    links: list[NetworkLink] = []
+    for network, attachment in zip(networks, attachments):
+        if isinstance(attachment, SocketAttachment):
+            device_id = f"catsnail-socket{socket_index}"
+            socket_index += 1
+        else:
+            device_id = f"catsnail-user{user_index}"
+            user_index += 1
+        links.append(NetworkLink(network=network, device_id=device_id))
+    return tuple(links)
 
 
 def _free_port() -> int:
